@@ -273,6 +273,69 @@ struct ParametricEQProcessorTests {
         #expect(abs(samples[4798] / 0.25 - 1.99526) < 0.001)
     }
 
+    @Test("L +6.0 dB raises only the left channel; R −6.0 dB lowers only the right",
+          arguments: [(Float(6), Float(0), Float(1.99526), Float(1)), (Float(0), Float(-6), Float(1), Float(0.501187))])
+    func channelTrim(expected: (left: Float, right: Float, leftRatio: Float, rightRatio: Float)) {
+        let processor = ParametricEQProcessor(sampleRate: 48000)
+        var s = ParametricEQSettings()
+        s.leftTrimDB = expected.left
+        s.rightTrimDB = expected.right
+        processor.updateSettings(s)
+        #expect(processor.isEnabled)
+
+        var samples: [Float] = Array(repeating: 0.25, count: 4800)
+        process(processor, &samples)
+        #expect(abs(samples[4798] / 0.25 - expected.leftRatio) < 0.0001)
+        #expect(abs(samples[4799] / 0.25 - expected.rightRatio) < 0.0001)
+    }
+
+    @Test("Trims add to the output gain per channel: output −3.0, L +1.0, R −2.0")
+    func trimsWithOutputGain() {
+        let processor = ParametricEQProcessor(sampleRate: 48000)
+        var s = ParametricEQSettings()
+        s.outputGainDB = -3
+        s.leftTrimDB = 1
+        s.rightTrimDB = -2
+        processor.updateSettings(s)
+
+        var samples: [Float] = Array(repeating: 0.25, count: 4800)
+        process(processor, &samples)
+        #expect(abs(samples[4798] / 0.25 - powf(10, -2.0 / 20)) < 0.0001)
+        #expect(abs(samples[4799] / 0.25 - powf(10, -5.0 / 20)) < 0.0001)
+    }
+
+    @Test("A trim alone enables the processor; the panel toggle still bypasses it")
+    func trimAloneEnables() {
+        let processor = ParametricEQProcessor(sampleRate: 48000)
+        var s = ParametricEQSettings()
+        s.rightTrimDB = 0.5
+        processor.updateSettings(s)
+        #expect(processor.isEnabled)
+        s.isEnabled = false
+        processor.updateSettings(s)
+        #expect(!processor.isEnabled)
+    }
+
+    @Test("Trims keep working with a curve and survive a sample rate change")
+    func trimsWithCurveAndRateChange() {
+        let processor = ParametricEQProcessor(sampleRate: 48000)
+        var s = settings(band: 2, frequency: 130, gainDB: -7.1, q: 10)
+        s.leftTrimDB = -3
+        processor.updateSettings(s)
+        processor.updateSampleRate(96000)
+
+        // Far from the 130 Hz notch the curve is ~0 dB, so the left/right ratio is the trim.
+        let input = stereoSine(frequency: 5000, amplitude: 0.25, sampleRate: 96000, frames: 96000)
+        var output = input
+        process(processor, &output)
+        var leftSq = 0.0, rightSq = 0.0
+        for f in 48000..<96000 {
+            leftSq += Double(output[f * 2]) * Double(output[f * 2])
+            rightSq += Double(output[f * 2 + 1]) * Double(output[f * 2 + 1])
+        }
+        #expect(abs(10 * log10(leftSq / rightSq) - -3) < 0.01)
+    }
+
     @Test("Sample rate change keeps the notch at 130 Hz")
     func sampleRateChange() {
         let processor = ParametricEQProcessor(sampleRate: 48000)
@@ -365,6 +428,68 @@ struct ParametricEQSettingsTests {
         #expect(s.isEffectivelyFlat)
         s.outputGainDB = -3
         #expect(!s.isEffectivelyFlat)
+    }
+
+    @Test("Trims: clamped to ±12 dB, stored at 0.1 dB, non-finite becomes 0")
+    func trimValidation() {
+        var s = ParametricEQSettings()
+        s.leftTrimDB = -30
+        s.rightTrimDB = 30
+        #expect(s.validated().leftTrimDB == -12)
+        #expect(s.validated().rightTrimDB == 12)
+        s.leftTrimDB = 0.44
+        s.rightTrimDB = -0.46
+        #expect(s.validated().leftTrimDB == 0.4)
+        #expect(s.validated().rightTrimDB == -0.5)
+        s.leftTrimDB = .nan
+        s.rightTrimDB = -.infinity
+        #expect(s.validated().leftTrimDB == 0)
+        #expect(s.validated().rightTrimDB == 0)
+    }
+
+    @Test("A trim makes a flat curve non-flat; each trim reaches only its own channel")
+    func trimFlatnessAndGains() {
+        var s = ParametricEQSettings()
+        #expect(s.channelGains.left == 1 && s.channelGains.right == 1)
+        s.leftTrimDB = 0.5
+        #expect(!s.isEffectivelyFlat)
+        #expect(abs(s.channelGains.left - powf(10, 0.5 / 20)) < 1e-7)
+        #expect(s.channelGains.right == 1)
+        s.leftTrimDB = 0
+        s.rightTrimDB = -1.5
+        #expect(!s.isEffectivelyFlat)
+        #expect(s.channelGains.left == 1)
+        #expect(abs(s.channelGains.right - powf(10, -1.5 / 20)) < 1e-7)
+    }
+
+    @Test("curveEquals ignores the trims, which belong to the device")
+    func curveEqualsIgnoresTrims() {
+        let a = settings(band: 2, frequency: 130, gainDB: -7.1, q: 10)
+        var b = a
+        b.leftTrimDB = 0.5
+        b.rightTrimDB = -1.5
+        #expect(a.curveEquals(b))
+        #expect(a != b)
+    }
+
+    @Test("Settings without trims decode at 0 dB; malformed trims decode at 0 dB; trims round-trip")
+    func trimDecoding() throws {
+        let old = """
+        {"bands":[],"outputGainDB":-2,"isEnabled":true}
+        """
+        let decodedOld = try JSONDecoder().decode(ParametricEQSettings.self, from: Data(old.utf8))
+        #expect(decodedOld.leftTrimDB == 0 && decodedOld.rightTrimDB == 0)
+        #expect(decodedOld.outputGainDB == -2)
+        let malformed = """
+        {"bands":[],"leftTrimDB":"loud","rightTrimDB":99}
+        """
+        let decodedBad = try JSONDecoder().decode(ParametricEQSettings.self, from: Data(malformed.utf8))
+        #expect(decodedBad.leftTrimDB == 0)
+        #expect(decodedBad.rightTrimDB == 12)
+        var s = ParametricEQSettings()
+        s.leftTrimDB = 0.5
+        s.rightTrimDB = -1.5
+        #expect(try JSONDecoder().decode(ParametricEQSettings.self, from: JSONEncoder().encode(s)) == s)
     }
 
     @Test("curveEquals ignores the on/off toggle")

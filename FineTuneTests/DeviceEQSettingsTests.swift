@@ -13,6 +13,8 @@ private func makeManager() -> (SettingsManager, URL) {
 private func curve(gainDB: Float = -7.1) -> ParametricEQSettings {
     var s = ParametricEQSettings()
     s.bands[2] = ParametricBand(frequency: 130, gainDB: gainDB, q: 10)
+    s.leftTrimDB = 0.5
+    s.rightTrimDB = -0.4
     return s
 }
 

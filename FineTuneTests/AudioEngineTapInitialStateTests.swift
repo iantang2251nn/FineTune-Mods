@@ -442,6 +442,8 @@ struct AudioEngineTapInitialStateTests {
 private func roomCurve(gainDB: Float = -7.1) -> ParametricEQSettings {
     var s = ParametricEQSettings()
     s.bands[2] = ParametricBand(frequency: 130, gainDB: gainDB, q: 10)
+    s.leftTrimDB = 0.5
+    s.rightTrimDB = -0.4
     return s
 }
 
@@ -521,7 +523,7 @@ struct AudioEngineDeviceEQTests {
         #expect(tap.lastDeviceEQ == roomCurve(gainDB: 3))
     }
 
-    @Test("Device curve is re-applied when the device reconnects")
+    @Test("Device curve and L/R trims are re-applied when the device reconnects")
     func curveReappliedOnReconnect() async throws {
         let fix = makeFixture(supportsAutoEQ: false, isAlive: { _ in true })
         var appSettings = fix.settings.appSettings

@@ -1200,6 +1200,90 @@ struct DeviceEQChainTests {
         #expect(result.peak <= SoftLimiter.ceiling)
     }
 
+    @Test("R −6.0 dB on an 8-channel interface: only the right of the preferred pair changes",
+          arguments: [(0, 1), (2, 3)])
+    func trimOnPreferredPair(pair: (left: Int, right: Int)) {
+        let frames = 1024
+        let channels = 8
+        let input = TestABL(buffers: [(channels: UInt32(channels), frames: frames)])
+        let output = TestABL(buffers: [(channels: UInt32(channels), frames: frames)])
+        let inData = input.data(at: 0)
+        for f in 0..<frames {
+            for ch in 0..<channels { inData[f * channels + ch] = testSample(frame: f, channel: ch) }
+        }
+        var device = ParametricEQSettings()
+        device.rightTrimDB = -6
+        let deviceEQ = ParametricEQProcessor(sampleRate: 48000)
+        deviceEQ.updateSettings(device)
+        let scratch = StereoScratchBuffer.allocate()
+        defer { scratch.deallocate() }
+
+        var vol: Float = 1.0
+        processWithDefaults(
+            input: input, output: output,
+            preferredStereoLeft: pair.left, preferredStereoRight: pair.right,
+            currentVol: &vol, deviceEQProc: deviceEQ,
+            stereoScratch: scratch.samples, scratchFrames: StereoScratchBuffer.frameCapacity
+        )
+
+        let gain = device.channelGains.right
+        let outData = output.data(at: 0)
+        for f in 0..<frames {
+            for ch in 0..<channels {
+                let got = outData[f * channels + ch]
+                let source = inData[f * channels + ch]
+                if ch == pair.right {
+                    #expect(abs(got - source * gain) < 1e-6, "frame \(f) right")
+                } else {
+                    #expect(got == source, "frame \(f) ch \(ch) must be untouched")
+                }
+            }
+        }
+    }
+
+    @Test("L +3.0 dB on two mono buffers: the left buffer is raised, the right untouched")
+    func trimOnSplitMono() {
+        let frames = 1024
+        let input = TestABL(buffers: [(channels: 1, frames: frames), (channels: 1, frames: frames)])
+        let output = TestABL(buffers: [(channels: 1, frames: frames), (channels: 1, frames: frames)])
+        for f in 0..<frames {
+            input.data(at: 0)[f] = testSample(frame: f, channel: 0)
+            input.data(at: 1)[f] = testSample(frame: f, channel: 1)
+        }
+        var device = ParametricEQSettings()
+        device.leftTrimDB = 3
+        let deviceEQ = ParametricEQProcessor(sampleRate: 48000)
+        deviceEQ.updateSettings(device)
+        let scratch = StereoScratchBuffer.allocate()
+        defer { scratch.deallocate() }
+
+        var vol: Float = 1.0
+        processWithDefaults(
+            input: input, output: output,
+            currentVol: &vol, deviceEQProc: deviceEQ,
+            stereoScratch: scratch.samples, scratchFrames: StereoScratchBuffer.frameCapacity
+        )
+
+        let gain = device.channelGains.left
+        #expect(gain > 1.41 && gain < 1.42)
+        for f in 0..<frames {
+            #expect(abs(output.data(at: 0)[f] - input.data(at: 0)[f] * gain) < 1e-6, "frame \(f) left")
+            #expect(output.data(at: 1)[f] == input.data(at: 1)[f], "frame \(f) right must be untouched")
+        }
+    }
+
+    @Test("L +12.0 dB on a full-scale signal stays under the limiter ceiling")
+    func trimBoostStaysBounded() {
+        var device = ParametricEQSettings()
+        device.leftTrimDB = 12
+        let deviceEQ = ParametricEQProcessor(sampleRate: 48000)
+        deviceEQ.updateSettings(device)
+
+        let result = stream(frequency: 1000, amplitude: 1.0, eqProc: nil, deviceEQProc: deviceEQ)
+        #expect(result.allFinite)
+        #expect(result.peak <= SoftLimiter.ceiling)
+    }
+
     @Test("Flat device PEQ: output bit-identical to no device PEQ")
     func flatDeviceEQIsBitExact() {
         let frames = 1024

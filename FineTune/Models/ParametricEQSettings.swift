@@ -24,7 +24,7 @@ nonisolated extension ParametricBand {
 }
 
 /// Per-device parametric EQ: a fixed layout of 10 bands (band 1 low shelf, bands 2–9 peaks,
-/// band 10 high shelf) plus an output gain stage for headroom.
+/// band 10 high shelf) plus an output gain stage for headroom and per-channel L/R trims.
 nonisolated struct ParametricEQSettings: Codable, Equatable {
     static let bandCount = 10
     /// Spread evenly on a log scale so the nodes start in order across the curve.
@@ -33,6 +33,7 @@ nonisolated struct ParametricEQSettings: Codable, Equatable {
     static let frequencyRange: ClosedRange<Double> = 20...20000
     static let gainRange: ClosedRange<Float> = -24...12
     static let outputGainRange: ClosedRange<Float> = -24...12
+    static let trimRange: ClosedRange<Float> = -12...12
     static let peakQRange: ClosedRange<Double> = 0.1...20
     /// `BiquadMath` shelves use Q directly; 0.71 is the RBJ slope S = 1 (steepest without overshoot).
     static let shelfQRange: ClosedRange<Double> = 0.3...2.0
@@ -71,15 +72,25 @@ nonisolated struct ParametricEQSettings: Codable, Equatable {
 
     var bands: [ParametricBand] = (0..<bandCount).map(defaultBand)
     var outputGainDB: Float = 0
+    /// Per-channel trims on top of the output gain: + raises that channel, − lowers it, and the
+    /// other channel is unaffected. Per-device state like `isEnabled`: presets and imports leave them alone.
+    var leftTrimDB: Float = 0
+    var rightTrimDB: Float = 0
     var isEnabled: Bool = true
 
-    /// True when processing would be identity: every enabled band at 0 dB and output at 0 dB.
-    /// A band at 0 dB is exact identity for all three RBJ types (A = 1).
+    /// True when processing would be identity: every enabled band at 0 dB, output and both trims
+    /// at 0 dB. A band at 0 dB is exact identity for all three RBJ types (A = 1).
     var isEffectivelyFlat: Bool {
-        outputGainDB == 0 && bands.allSatisfy { !$0.isEnabled || $0.gainDB == 0 }
+        outputGainDB == 0 && leftTrimDB == 0 && rightTrimDB == 0
+            && bands.allSatisfy { !$0.isEnabled || $0.gainDB == 0 }
     }
 
-    /// Curve identity for preset matching; ignores the panel on/off toggle.
+    /// Linear gain for each channel: output gain plus that channel's trim.
+    var channelGains: (left: Float, right: Float) {
+        (powf(10, (outputGainDB + leftTrimDB) / 20), powf(10, (outputGainDB + rightTrimDB) / 20))
+    }
+
+    /// Curve identity for preset matching; ignores the panel on/off toggle and the trims.
     func curveEquals(_ other: ParametricEQSettings) -> Bool {
         bands == other.bands && outputGainDB == other.outputGainDB
     }
@@ -110,7 +121,13 @@ nonisolated struct ParametricEQSettings: Codable, Equatable {
         result.outputGainDB = outputGainDB.isFinite
             ? Self.quantizedGain(min(max(outputGainDB, Self.outputGainRange.lowerBound), Self.outputGainRange.upperBound))
             : 0
+        result.leftTrimDB = Self.validatedTrim(leftTrimDB)
+        result.rightTrimDB = Self.validatedTrim(rightTrimDB)
         return result
+    }
+
+    private static func validatedTrim(_ db: Float) -> Float {
+        db.isFinite ? quantizedGain(min(max(db, trimRange.lowerBound), trimRange.upperBound)) : 0
     }
 
     static let flat = ParametricEQSettings()
@@ -126,6 +143,8 @@ nonisolated extension ParametricEQSettings {
         self.init(
             bands: decodedBands,
             outputGainDB: (try? c.decodeIfPresent(Float.self, forKey: .outputGainDB)) ?? 0,
+            leftTrimDB: (try? c.decodeIfPresent(Float.self, forKey: .leftTrimDB)) ?? 0,
+            rightTrimDB: (try? c.decodeIfPresent(Float.self, forKey: .rightTrimDB)) ?? 0,
             isEnabled: (try? c.decodeIfPresent(Bool.self, forKey: .isEnabled)) ?? true
         )
         self = validated()

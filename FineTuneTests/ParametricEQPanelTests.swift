@@ -64,6 +64,35 @@ struct ParametricValueFieldTests {
         #expect(ParametricValueFormat.parseQ("-1") == nil)
     }
 
+    @Test("Trim display is signed with a true minus and no unit; 0.0 unsigned")
+    func trimDisplay() {
+        #expect(ParametricValueFormat.trim(0.5) == "+0.5")
+        #expect(ParametricValueFormat.trim(-1.5) == "\u{2212}1.5")
+        #expect(ParametricValueFormat.trim(0) == "0.0")
+        #expect(ParametricValueFormat.trim(-0.01) == "0.0")
+        #expect(ParametricValueFormat.trim(-12) == "\u{2212}12.0")
+        #expect(ParametricValueFormat.trim(12) == "+12.0")
+    }
+
+    @Test("Every trim display string types back to its value", arguments: [-12.0, -1.5, -0.1, 0, 0.1, 0.5, 12])
+    func trimRoundTrip(value: Double) {
+        #expect(ParametricValueFormat.parseTrim(ParametricValueFormat.trim(value), channel: "L") == value)
+    }
+
+    @Test("Typed trim accepts the field's own channel letter, and rejects the other one")
+    func trimParsing() {
+        #expect(ParametricValueFormat.parseTrim("L +0.5 dB", channel: "L") == 0.5)
+        #expect(ParametricValueFormat.parseTrim("l-1.5", channel: "L") == -1.5)
+        #expect(ParametricValueFormat.parseTrim("+0.5", channel: "L") == 0.5)
+        #expect(ParametricValueFormat.parseTrim("\u{2212}1.5 dB", channel: "R") == -1.5)
+        #expect(ParametricValueFormat.parseTrim("R 2", channel: "R") == 2)
+        #expect(ParametricValueFormat.parseTrim("R +0.5", channel: "L") == nil)
+        #expect(ParametricValueFormat.parseTrim("L -1", channel: "R") == nil)
+        #expect(ParametricValueFormat.parseTrim("L", channel: "L") == nil)
+        #expect(ParametricValueFormat.parseTrim("", channel: "L") == nil)
+        #expect(ParametricValueFormat.parseTrim("L inf", channel: "L") == nil)
+    }
+
     @Test("Scrub scaling: 0.1 dB per pt, 1/48 octave per pt, ×2 Q per 100 pt")
     func scrubScaling() {
         #expect(abs(ScrubValueField.Scale.linear(perPoint: 0.1).apply(0, points: 10) - 1.0) < 1e-12)

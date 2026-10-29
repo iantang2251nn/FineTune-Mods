@@ -7,14 +7,16 @@ import Accelerate
 /// Subclass of `BiquadProcessor` — inherits delay buffer management, atomic setup swaps,
 /// stereo biquad processing, and NaN safety. Always runs `ParametricEQSettings.bandCount`
 /// sections with band i in section i (a disabled band is an identity section), so toggling
-/// a band never shifts filter state between sections. Output gain is applied before the cascade.
+/// a band never shifts filter state between sections. Output gain and the L/R trims are applied
+/// before the cascade as one gain per channel.
 final class ParametricEQProcessor: BiquadProcessor, @unchecked Sendable {
 
     /// Currently applied settings (needed for sample rate recalculation)
     private var _currentSettings: ParametricEQSettings = .flat
 
-    /// Output gain in linear scale (RT-safe atomic read in process)
-    private nonisolated(unsafe) var _outputGain: Float = 1.0
+    /// Per-channel gain (output gain + that channel's trim) in linear scale (RT-safe atomic reads in process)
+    private nonisolated(unsafe) var _leftGain: Float = 1.0
+    private nonisolated(unsafe) var _rightGain: Float = 1.0
 
     /// Read-only access to current settings
     var currentSettings: ParametricEQSettings { _currentSettings }
@@ -51,7 +53,7 @@ final class ParametricEQProcessor: BiquadProcessor, @unchecked Sendable {
         }
 
         // Atomic state update + setup swap
-        _outputGain = powf(10.0, validated.outputGainDB / 20.0)
+        (_leftGain, _rightGain) = validated.channelGains
         swapSetup(newSetup)
         setEnabled(true)
 
@@ -66,9 +68,11 @@ final class ParametricEQProcessor: BiquadProcessor, @unchecked Sendable {
         return (coefficients, ParametricEQSettings.bandCount)
     }
 
-    /// Apply output gain before the biquad cascade (RT-safe).
+    /// Apply output gain and the L/R trims before the biquad cascade (RT-safe).
     override func preProcess(output: UnsafeMutablePointer<Float>, frameCount: Int) {
-        var gain = _outputGain
-        vDSP_vsmul(output, 1, &gain, output, 1, vDSP_Length(frameCount * 2))
+        var left = _leftGain
+        var right = _rightGain
+        vDSP_vsmul(output, 2, &left, output, 2, vDSP_Length(frameCount))
+        vDSP_vsmul(output.advanced(by: 1), 2, &right, output.advanced(by: 1), 2, vDSP_Length(frameCount))
     }
 }

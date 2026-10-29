@@ -180,6 +180,9 @@ struct ParametricEQPanelView: View {
 
             Spacer(minLength: DesignTokens.Spacing.sm)
 
+            trimField("L", channel: "Left", \.leftTrimDB)
+            trimField("R", channel: "Right", \.rightTrimDB)
+
             ScrubValueField(
                 label: "OUTPUT",
                 value: Double(settings.outputGainDB),
@@ -192,6 +195,22 @@ struct ParametricEQPanelView: View {
                 resetHelp: "Double-click to reset to 0 dB"
             )
         }
+    }
+
+    /// A channel trim field, with the same input as OUTPUT.
+    private func trimField(_ label: String, channel: String, _ trim: WritableKeyPath<ParametricEQSettings, Float>) -> some View {
+        ScrubValueField(
+            label: label,
+            value: Double(settings[keyPath: trim]),
+            range: Double(ParametricEQSettings.trimRange.lowerBound)...Double(ParametricEQSettings.trimRange.upperBound),
+            scale: .linear(perPoint: 0.1),
+            format: ParametricValueFormat.trim,
+            parse: { ParametricValueFormat.parseTrim($0, channel: Character(label)) },
+            onChange: { value in update { $0[keyPath: trim] = Float(value) } },
+            onReset: { update { $0[keyPath: trim] = 0 } },
+            resetHelp: "\(channel) channel trim in dB. Double-click to reset to 0 dB"
+        )
+        .frame(width: 44, alignment: .leading)
     }
 
     private func bandChip(_ index: Int) -> some View {
@@ -380,9 +399,11 @@ struct ParametricEQPanelView: View {
     private func commitSave() {
         let trimmed = savePresetName.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
-        // Store with isEnabled = true — isEnabled is per-device state, not preset state
+        // Store with isEnabled = true and trims at 0 dB — all per-device state, not preset state
         var presetSettings = settings
         presetSettings.isEnabled = true
+        presetSettings.leftTrimDB = 0
+        presetSettings.rightTrimDB = 0
         onSavePreset(trimmed, presetSettings)
         isSaving = false
         savePresetName = ""

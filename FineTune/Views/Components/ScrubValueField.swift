@@ -207,6 +207,13 @@ enum ParametricValueFormat {
         String(format: "%.2f", q)
     }
 
+    /// `+0.5`, `−1.5`, `0.0` — channel trims, whose fields are too narrow for the unit.
+    static func trim(_ db: Double) -> String {
+        let magnitude = String(format: "%.1f", abs(db))
+        if magnitude == "0.0" { return "0.0" }
+        return (db < 0 ? "\u{2212}" : "+") + magnitude
+    }
+
     /// Accepts `130`, `130 Hz`, `1.2k`, `1.2 kHz`, `1200`.
     static func parseFrequency(_ text: String) -> Double? {
         var cleaned = text.lowercased().replacingOccurrences(of: " ", with: "")
@@ -228,6 +235,15 @@ enum ParametricValueFormat {
         if cleaned.hasSuffix("db") { cleaned.removeLast(2) }
         guard let value = Double(cleaned), value.isFinite else { return nil }
         return value
+    }
+
+    /// Accepts what `parseGain` accepts, optionally after the field's own channel letter:
+    /// `+0.5`, `L +0.5 dB`, `l-1.5`. Another channel's letter is rejected.
+    static func parseTrim(_ text: String, channel: Character) -> Double? {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        guard let first = trimmed.first, first.isLetter else { return parseGain(trimmed) }
+        guard first.lowercased() == channel.lowercased() else { return nil }
+        return parseGain(String(trimmed.dropFirst()))
     }
 
     /// Accepts `10`, `10.00`, `q 10`.
