@@ -65,7 +65,7 @@ final class URLHandler {
 
     /// Set volumes for one or more apps
     /// URL format: finetune://set-volumes?app=com.a&volume=100&app=com.b&volume=50
-    /// Volume is percentage: 0-100 (gain only, boost is per-app and set separately)
+    /// Volume is percentage: 0-100
     private func handleSetVolumes(queryItems: [URLQueryItem]) {
         var pairs: [(identifier: String, volume: Int)] = []
         var currentApp: String?

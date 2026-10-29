@@ -2,7 +2,7 @@
 
 <h3>FineTune</h3>
 
-为每一个 App 单独控制音量、把过轻的声音最高放大 4 倍、把音频路由到不同的扬声器，再用 EQ 和耳机曲线把声音调到自己喜欢的样子。常驻菜单栏，免费且开源。
+为每一个 App 单独控制音量、把音频路由到不同的扬声器，再用 EQ 和耳机曲线把声音调到自己喜欢的样子。常驻菜单栏，免费且开源。
 
 <a href="https://github.com/ronitsingh10/FineTune/releases/latest/download/FineTune.dmg"><img src="assets/download-badge.svg" alt="下载 macOS 版本" height="48"/></a>
 
@@ -54,7 +54,6 @@ brew install --cask finetune
 
 ### 🎚 音量控制
 - **按 App 控制音量** —— 为每个应用提供独立的音量滑块和静音
-- **按 App 增益** —— 提供 2x / 3x / 4x 三档增益预设
 - **置顶 App** —— 即使应用没有在播放声音，也让它一直显示在菜单栏中，方便提前配置音量、EQ 和路由
 - **忽略 App** —— 让 FineTune 完全脱离指定的应用，撤掉对应的音频接入点，让该应用回到 macOS 默认的音频通路
 - **滚轮调节音量** —— 把鼠标悬停到弹窗、HUD 或 EQ 面板的任一滑块上，滚动滚轮即可调节

@@ -1,5 +1,5 @@
 // FineTuneTests/VolumeMappingTests.swift
-// Tests for VolumeMapping square-law curve and BoostLevel contracts.
+// Tests for the VolumeMapping square-law curve.
 // Pure math — no audio hardware, no CoreAudio.
 
 import Testing
@@ -132,64 +132,5 @@ struct VolumeMappingTierTests {
         #expect(VolumeMapping.sliderFraction(forSystemGain:  1.5, tier: .hardware) == 1.0)
         #expect(VolumeMapping.systemGain(forSliderFraction: -0.1, tier: .ddc) == 0)
         #expect(VolumeMapping.systemGain(forSliderFraction:  1.5, tier: .software) == 1.0)
-    }
-}
-
-// MARK: - BoostLevel
-
-@Suite("BoostLevel — Enumeration and cycling")
-struct BoostLevelTests {
-
-    @Test("allCases has exactly 4 levels")
-    func allCasesCount() {
-        #expect(BoostLevel.allCases.count == 4)
-    }
-
-    @Test("Raw values match expected multipliers",
-          arguments: [
-            (BoostLevel.x1, Float(1.0)),
-            (BoostLevel.x2, Float(2.0)),
-            (BoostLevel.x3, Float(3.0)),
-            (BoostLevel.x4, Float(4.0)),
-          ])
-    func rawValues(level: BoostLevel, expected: Float) {
-        #expect(level.rawValue == expected)
-    }
-
-    @Test("next cycles through all levels and wraps")
-    func nextCycles() {
-        #expect(BoostLevel.x1.next == .x2)
-        #expect(BoostLevel.x2.next == .x3)
-        #expect(BoostLevel.x3.next == .x4)
-        #expect(BoostLevel.x4.next == .x1)
-    }
-
-    @Test("isBoosted is false only for x1")
-    func isBoosted() {
-        #expect(!BoostLevel.x1.isBoosted)
-        #expect(BoostLevel.x2.isBoosted)
-        #expect(BoostLevel.x3.isBoosted)
-        #expect(BoostLevel.x4.isBoosted)
-    }
-
-    @Test("Labels match expected format",
-          arguments: [
-            (BoostLevel.x1, "1x"),
-            (BoostLevel.x2, "2x"),
-            (BoostLevel.x3, "3x"),
-            (BoostLevel.x4, "4x"),
-          ])
-    func labels(level: BoostLevel, expected: String) {
-        #expect(level.label == expected)
-    }
-
-    @Test("BoostLevel can be initialized from raw value")
-    func initFromRawValue() {
-        #expect(BoostLevel(rawValue: 1.0) == .x1)
-        #expect(BoostLevel(rawValue: 2.0) == .x2)
-        #expect(BoostLevel(rawValue: 3.0) == .x3)
-        #expect(BoostLevel(rawValue: 4.0) == .x4)
-        #expect(BoostLevel(rawValue: 1.5) == nil)
-        #expect(BoostLevel(rawValue: 0.0) == nil)
     }
 }

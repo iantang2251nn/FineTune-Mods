@@ -69,14 +69,6 @@ final class AppListCoordinator {
         settingsManager.setVolume(for: identifier, to: volume)
     }
 
-    func getBoostForInactive(identifier: String) -> BoostLevel {
-        settingsManager.getBoost(for: identifier) ?? .x1
-    }
-
-    func setBoostForInactive(identifier: String, to boost: BoostLevel) {
-        settingsManager.setBoost(for: identifier, to: boost)
-    }
-
     func getMuteForInactive(identifier: String) -> Bool {
         settingsManager.getMute(for: identifier) ?? false
     }

@@ -501,14 +501,6 @@ final class AudioEngine {
         appListCoordinator.setVolumeForInactive(identifier: identifier, to: volume)
     }
 
-    func getBoostForInactive(identifier: String) -> BoostLevel {
-        appListCoordinator.getBoostForInactive(identifier: identifier)
-    }
-
-    func setBoostForInactive(identifier: String, to boost: BoostLevel) {
-        appListCoordinator.setBoostForInactive(identifier: identifier, to: boost)
-    }
-
     func getMuteForInactive(identifier: String) -> Bool {
         appListCoordinator.getMuteForInactive(identifier: identifier)
     }
@@ -661,26 +653,13 @@ final class AudioEngine {
         volumeState.getVolume(for: app.id)
     }
 
-    // MARK: - Boost
-
-    func setBoost(for app: AudioApp, to boost: BoostLevel) {
-        volumeState.setBoost(for: app.id, to: boost, identifier: app.persistenceIdentifier)
-        if let tap = taps[app.id] {
-            tap.volume = effectiveVolume(for: app.id, deviceUIDs: tap.currentDeviceUIDs)
-        }
-    }
-
-    func getBoost(for app: AudioApp) -> BoostLevel {
-        volumeState.getBoost(for: app.id)
-    }
-
-    /// Effective gain for ProcessTapController: app volume × boost, plus optional
+    /// Effective gain for ProcessTapController: app volume, plus optional
     /// single-device software output gain for software-backed devices.
     /// Single-device-routed apps on `.software`-backed devices always receive the
     /// device's software gain; multi-destination routing keeps `appGain` alone
     /// because per-device software gain has no unambiguous meaning across fan-out.
     private func effectiveVolume(for pid: pid_t, deviceUIDs: [String]? = nil) -> Float {
-        let appGain = volumeState.getVolume(for: pid) * volumeState.getBoost(for: pid).rawValue
+        let appGain = volumeState.getVolume(for: pid)
 
         guard let resolvedUIDs = deviceUIDs, resolvedUIDs.count == 1,
               let primaryUID = resolvedUIDs.first,
@@ -693,7 +672,6 @@ final class AudioEngine {
     }
 
     /// Estimated listening level for loudness compensation: device volume × per-app slider.
-    /// Does not include boost (intentional amplification beyond reference).
     /// The compensator's phon estimation clamps to [0,1] so values > 1 are treated as reference.
     private func effectiveLoudnessVolume(for tap: any ProcessTapControlling) -> Float {
         tap.currentDeviceVolume * volumeState.getVolume(for: tap.app.id)
@@ -1142,10 +1120,9 @@ final class AudioEngine {
             let savedMode = volumeState.loadSavedDeviceSelectionMode(for: app.id, identifier: app.persistenceIdentifier)
             let mode = savedMode ?? .single
 
-            // Load saved volume, mute, and boost state
+            // Load saved volume and mute state
             let savedVolume = volumeState.loadSavedVolume(for: app.id, identifier: app.persistenceIdentifier)
             let savedMute = volumeState.loadSavedMute(for: app.id, identifier: app.persistenceIdentifier)
-            _ = volumeState.loadSavedBoost(for: app.id, identifier: app.persistenceIdentifier)
 
             // Handle multi-device mode
             if mode == .multi {
@@ -1164,7 +1141,7 @@ final class AudioEngine {
                         appDeviceRouting[app.id] = availableUIDs[0]
                         appliedPIDs.insert(app.id)
 
-                        // Apply volume (with boost) and mute
+                        // Apply volume and mute
                         if savedVolume != nil {
                             if let tap = taps[app.id] {
                                 applyTapOutputState(to: tap, for: app.id, deviceUIDs: availableUIDs)
@@ -1237,7 +1214,7 @@ final class AudioEngine {
             if savedVolume != nil {
                 let effective = effectiveVolume(for: app.id, deviceUIDs: [deviceUID])
                 let displayPercent = Int(effective * 100)
-                logger.debug("Applying saved volume \(displayPercent)% (with boost) to \(app.name)")
+                logger.debug("Applying saved volume \(displayPercent)% to \(app.name)")
                 taps[app.id]?.volume = effective
             }
 

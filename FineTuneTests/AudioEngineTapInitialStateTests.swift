@@ -571,6 +571,23 @@ struct AudioEngineDeviceEQTests {
     }
 }
 
+@Suite("AudioEngine — app volume")
+@MainActor
+struct AudioEngineAppVolumeTests {
+
+    @Test("The app slider's gain reaches the tap as-is: no multiplier, never above unity",
+          arguments: [Float(0), 0.25, 0.5, 1.0])
+    func volumeReachesTapUnscaled(volume: Float) throws {
+        let fix = makeFixture()
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+        let tap = try #require(fix.lastTap())
+
+        fix.engine.setVolume(for: fix.app, to: volume)
+        #expect(tap.volume == volume)
+        #expect(fix.engine.getVolume(for: fix.app) == volume)
+    }
+}
+
 // MARK: - Helpers
 
 @MainActor

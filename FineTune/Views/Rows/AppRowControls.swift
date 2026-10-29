@@ -13,11 +13,9 @@ struct AppRowControls: View {
     let isFollowingDefault: Bool
     let defaultDeviceUID: String?
     let deviceSelectionMode: DeviceSelectionMode
-    let boost: BoostLevel
     let isEQExpanded: Bool
     let onVolumeChange: (Float) -> Void
     let onMuteChange: (Bool) -> Void
-    let onBoostChange: (BoostLevel) -> Void
     let onDeviceSelected: (String) -> Void
     let onDevicesSelected: (Set<String>) -> Void
     let onDeviceModeChange: (DeviceSelectionMode) -> Void
@@ -97,9 +95,6 @@ struct AppRowControls: View {
                 range: 0...100,
                 isRowFocused: isRowFocused
             )
-
-            // Boost chevrons
-            BoostChevrons(level: boost, onTap: { onBoostChange(boost.next) })
 
             DevicePicker(
                 devices: devices,

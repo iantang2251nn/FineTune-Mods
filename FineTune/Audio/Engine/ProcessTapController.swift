@@ -46,7 +46,7 @@ final class ProcessTapController: ProcessTapControlling {
     // The audio callback reads these values; the main thread writes them.
     // No lock is needed because single-word aligned loads/stores are atomic.
 
-    /// Target gain set by AudioEngine (volume × boost). Range 0.0-4.0 (1.0 = unity, 4.0 = +12dB).
+    /// Target gain set by AudioEngine (app volume, times the device's software gain on software-volume devices). 1.0 = unity.
     private nonisolated(unsafe) var _volume: Float = 1.0
     /// Current ramped volume for primary tap (smoothly approaches _volume)
     private nonisolated(unsafe) var _primaryCurrentVolume: Float = 1.0

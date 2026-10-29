@@ -2,7 +2,7 @@
 
 <h3>FineTune</h3>
 
-Control the volume of every app independently, boost quiet ones up to 4x, route audio to different speakers, and shape your sound with EQ and headphone correction. Lives in your menu bar. Free and open-source.
+Control the volume of every app independently, route audio to different speakers, and shape your sound with EQ and headphone correction. Lives in your menu bar. Free and open-source.
 
 <a href="https://github.com/ronitsingh10/FineTune/releases/latest/download/FineTune.dmg"><img src="assets/download-badge.svg" alt="Download for macOS" height="48"/></a>
 
@@ -52,7 +52,6 @@ That's it. Adjust sliders, route audio, and explore EQ from the menu bar.
 
 ### 🎚 Volume Control
 - **Per-app volume** — Individual sliders and mute for each application
-- **Per-app volume boost** — 2x / 3x / 4x gain presets
 - **Pinned apps** — Keep apps visible in the menu bar even when they're not playing, so you can configure volume, EQ, and routing in advance
 - **Ignore apps** — Completely disengage FineTune from specific apps. Tears down the audio tap so the app returns to normal macOS audio
 - **Scroll-wheel volume** — Hover any slider in the popup, the HUD, or the EQ panel and scroll to adjust.

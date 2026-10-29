@@ -927,10 +927,6 @@ struct MenuBarPopupView: View {
                 isFollowingDefault: audioEngine.isFollowingDefault(for: app),
                 defaultDeviceUID: deviceVolumeMonitor.defaultDeviceUID,
                 deviceSelectionMode: audioEngine.getDeviceSelectionMode(for: app),
-                boost: audioEngine.getBoost(for: app),
-                onBoostChange: { boost in
-                    audioEngine.setBoost(for: app, to: boost)
-                },
                 getAudioLevel: { audioEngine.getAudioLevel(for: app) },
                 isPopupVisible: isPopupVisible,
                 onVolumeChange: { volume in
@@ -1000,10 +996,6 @@ struct MenuBarPopupView: View {
             defaultDeviceUID: deviceVolumeMonitor.defaultDeviceUID,
             deviceSelectionMode: audioEngine.getDeviceSelectionModeForInactive(identifier: identifier),
             isMuted: audioEngine.getMuteForInactive(identifier: identifier),
-            boost: audioEngine.getBoostForInactive(identifier: identifier),
-            onBoostChange: { boost in
-                audioEngine.setBoostForInactive(identifier: identifier, to: boost)
-            },
             onVolumeChange: { volume in
                 audioEngine.setVolumeForInactive(identifier: identifier, to: volume)
             },

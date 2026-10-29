@@ -10,7 +10,7 @@ import SwiftUI
 struct InactiveAppRow: View {
     let appInfo: PinnedAppInfo
     let icon: NSImage
-    let volume: Float  // Linear gain 0-1 (boost applied separately)
+    let volume: Float  // Linear gain 0-1
     let devices: [AudioDevice]
     let deviceIconOverrides: [String: String]
     let selectedDeviceUID: String?
@@ -19,8 +19,6 @@ struct InactiveAppRow: View {
     let defaultDeviceUID: String?
     let deviceSelectionMode: DeviceSelectionMode
     let isMuted: Bool
-    let boost: BoostLevel
-    let onBoostChange: (BoostLevel) -> Void
     let onVolumeChange: (Float) -> Void
     let onMuteChange: (Bool) -> Void
     let onDeviceSelected: (String) -> Void
@@ -52,8 +50,6 @@ struct InactiveAppRow: View {
         defaultDeviceUID: String? = nil,
         deviceSelectionMode: DeviceSelectionMode = .single,
         isMuted: Bool = false,
-        boost: BoostLevel = .x1,
-        onBoostChange: @escaping (BoostLevel) -> Void = { _ in },
         onVolumeChange: @escaping (Float) -> Void,
         onMuteChange: @escaping (Bool) -> Void,
         onDeviceSelected: @escaping (String) -> Void,
@@ -82,8 +78,6 @@ struct InactiveAppRow: View {
         self.defaultDeviceUID = defaultDeviceUID
         self.deviceSelectionMode = deviceSelectionMode
         self.isMuted = isMuted
-        self.boost = boost
-        self.onBoostChange = onBoostChange
         self.onVolumeChange = onVolumeChange
         self.onMuteChange = onMuteChange
         self.onDeviceSelected = onDeviceSelected
@@ -151,11 +145,9 @@ struct InactiveAppRow: View {
                     isFollowingDefault: isFollowingDefault,
                     defaultDeviceUID: defaultDeviceUID,
                     deviceSelectionMode: deviceSelectionMode,
-                    boost: boost,
                     isEQExpanded: isEQExpanded,
                     onVolumeChange: onVolumeChange,
                     onMuteChange: onMuteChange,
-                    onBoostChange: onBoostChange,
                     onDeviceSelected: onDeviceSelected,
                     onDevicesSelected: onDevicesSelected,
                     onDeviceModeChange: onDeviceModeChange,

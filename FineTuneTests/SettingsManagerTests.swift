@@ -23,12 +23,22 @@ struct SettingsJSONTests {
         #expect(decoded.systemSoundsFollowsDefault == original.systemSoundsFollowsDefault)
     }
 
+    @Test("A settings file from before per-app boost was removed still loads; the boost is dropped")
+    func legacyAppBoostsIgnored() throws {
+        let json = """
+        {"version":12,"appVolumes":{"com.test.app":0.5},"appBoosts":{"com.test.app":4.0}}
+        """
+        let decoded = try JSONDecoder().decode(SettingsManager.Settings.self, from: Data(json.utf8))
+        #expect(decoded.appVolumes == ["com.test.app": 0.5])
+        let reencoded = String(decoding: try JSONEncoder().encode(decoded), as: UTF8.self)
+        #expect(!reencoded.contains("appBoosts"))
+    }
+
     @Test("Populated Settings round-trips all fields")
     func populatedRoundTrip() throws {
         var original = SettingsManager.Settings()
         original.appVolumes = ["com.test.app": 0.5]
         original.appMutes = ["com.test.app": true]
-        original.appBoosts = ["com.test.app": 2.0]
         original.appDeviceRouting = ["com.test.app": "device-uid-123"]
         original.pinnedApps = Set(["com.test.app"])
         original.outputDevicePriority = ["uid-a", "uid-b", "uid-c"]
@@ -44,7 +54,6 @@ struct SettingsJSONTests {
 
         #expect(decoded.appVolumes == original.appVolumes)
         #expect(decoded.appMutes == original.appMutes)
-        #expect(decoded.appBoosts == original.appBoosts)
         #expect(decoded.appDeviceRouting == original.appDeviceRouting)
         #expect(decoded.pinnedApps == original.pinnedApps)
         #expect(decoded.outputDevicePriority == original.outputDevicePriority)

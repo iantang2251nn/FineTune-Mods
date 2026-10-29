@@ -13,8 +13,6 @@ struct AppRowWithLevelPolling: View {
     let isFollowingDefault: Bool
     let defaultDeviceUID: String?
     let deviceSelectionMode: DeviceSelectionMode
-    let boost: BoostLevel
-    let onBoostChange: (BoostLevel) -> Void
     let getAudioLevel: () -> Float
     let isPopupVisible: Bool
     let onVolumeChange: (Float) -> Void
@@ -49,8 +47,6 @@ struct AppRowWithLevelPolling: View {
         isFollowingDefault: Bool = true,
         defaultDeviceUID: String? = nil,
         deviceSelectionMode: DeviceSelectionMode = .single,
-        boost: BoostLevel = .x1,
-        onBoostChange: @escaping (BoostLevel) -> Void = { _ in },
         getAudioLevel: @escaping () -> Float,
         isPopupVisible: Bool = true,
         onVolumeChange: @escaping (Float) -> Void,
@@ -81,8 +77,6 @@ struct AppRowWithLevelPolling: View {
         self.isFollowingDefault = isFollowingDefault
         self.defaultDeviceUID = defaultDeviceUID
         self.deviceSelectionMode = deviceSelectionMode
-        self.boost = boost
-        self.onBoostChange = onBoostChange
         self.getAudioLevel = getAudioLevel
         self.isPopupVisible = isPopupVisible
         self.onVolumeChange = onVolumeChange
@@ -117,8 +111,6 @@ struct AppRowWithLevelPolling: View {
             defaultDeviceUID: defaultDeviceUID,
             deviceSelectionMode: deviceSelectionMode,
             isMuted: isMuted,
-            boost: boost,
-            onBoostChange: onBoostChange,
             onVolumeChange: onVolumeChange,
             onMuteChange: onMuteChange,
             onDeviceSelected: onDeviceSelected,
