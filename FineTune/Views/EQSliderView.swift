@@ -120,6 +120,10 @@ struct EQSliderView: View {
                     .font(DesignTokens.Typography.caption)
                     .foregroundStyle(DesignTokens.Colors.textTertiary)
             }
+            .contentShape(Rectangle())
+            .onTapGesture(count: 2) { gain = 0 }
+            .help("Double-click to reset to 0 dB")
+            .accessibilityAction(named: "Reset to 0 dB") { gain = 0 }
         }
         .onAppear {
             localGain = gain  // Initialize from binding
