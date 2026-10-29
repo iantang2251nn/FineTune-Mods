@@ -20,6 +20,7 @@ protocol ProcessTapControlling: AnyObject, Sendable {
     func invalidate()
     func invalidateAsync() async
     func updateEQSettings(_ settings: EQSettings)
+    func updateDeviceEQ(_ settings: ParametricEQSettings)
     func updateAutoEQProfile(_ profile: AutoEQProfile?)
     func setAutoEQPreampEnabled(_ enabled: Bool)
     func updateLoudnessCompensation(volume: Float, enabled: Bool)

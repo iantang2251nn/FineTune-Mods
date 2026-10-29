@@ -18,6 +18,7 @@ final class RecordingProcessTapController: ProcessTapControlling {
     enum Event: Equatable {
         case activate(TapInitialStateSnapshot)
         case updateEQSettings(EQSettings)
+        case updateDeviceEQ(ParametricEQSettings)
         case updateAutoEQProfile(profileID: String?)
         case setAutoEQPreampEnabled(Bool)
         case updateLoudnessCompensation(volume: Float, enabled: Bool)
@@ -29,6 +30,7 @@ final class RecordingProcessTapController: ProcessTapControlling {
     /// the source-type's identity (defensive against future mutations).
     struct TapInitialStateSnapshot: Equatable {
         var eqSettings: EQSettings
+        var deviceEQ: ParametricEQSettings
         var autoEQProfileID: String?
         var autoEQPreampEnabled: Bool
         var loudnessVolume: Float
@@ -38,6 +40,7 @@ final class RecordingProcessTapController: ProcessTapControlling {
         @MainActor
         init(_ s: TapInitialState) {
             self.eqSettings = s.eqSettings
+            self.deviceEQ = s.deviceEQ
             self.autoEQProfileID = s.autoEQProfile?.id
             self.autoEQPreampEnabled = s.autoEQPreampEnabled
             self.loudnessVolume = s.loudnessVolume
@@ -74,6 +77,10 @@ final class RecordingProcessTapController: ProcessTapControlling {
 
     func updateEQSettings(_ settings: EQSettings) {
         events.append(.updateEQSettings(settings))
+    }
+
+    func updateDeviceEQ(_ settings: ParametricEQSettings) {
+        events.append(.updateDeviceEQ(settings))
     }
 
     func updateAutoEQProfile(_ profile: AutoEQProfile?) {
@@ -132,7 +139,8 @@ private struct Fixture {
 @MainActor
 private func makeFixture(
     supportsAutoEQ: Bool = true,
-    deviceVolume: Float = 0.75
+    deviceVolume: Float = 0.75,
+    isAlive: ((AudioDeviceID) -> Bool)? = nil
 ) -> Fixture {
     let tempDir = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString)
@@ -184,6 +192,7 @@ private func makeFixture(
             box.last = tap
             return tap
         },
+        isAlive: isAlive,
         startMonitorsAutomatically: false
     )
 
@@ -387,7 +396,7 @@ struct AudioEngineTapInitialStateTests {
 
         for event in tap.events.prefix(activateIndex) {
             switch event {
-            case .updateEQSettings, .updateAutoEQProfile, .setAutoEQPreampEnabled,
+            case .updateEQSettings, .updateDeviceEQ, .updateAutoEQProfile, .setAutoEQPreampEnabled,
                  .updateLoudnessCompensation, .updateLoudnessEqualization:
                 Issue.record("Pre-activate mutation breaks the apply-initial-state contract: \(event)")
             case .activate, .invalidate:
@@ -425,6 +434,138 @@ struct AudioEngineTapInitialStateTests {
             return nil
         }
         #expect(postActivateAutoEQ.contains(where: { $0 == nil }))
+    }
+}
+
+// MARK: - Device Parametric EQ
+
+private func roomCurve(gainDB: Float = -7.1) -> ParametricEQSettings {
+    var s = ParametricEQSettings()
+    s.bands[2] = ParametricBand(frequency: 130, gainDB: gainDB, q: 10)
+    return s
+}
+
+private extension RecordingProcessTapController {
+    /// The most recent curve pushed through `updateDeviceEQ`, if any.
+    var lastDeviceEQ: ParametricEQSettings? {
+        for event in events.reversed() {
+            if case let .updateDeviceEQ(settings) = event { return settings }
+        }
+        return nil
+    }
+}
+
+/// Yields to the engine's switch Tasks until `condition` holds (or ~2 s pass).
+@MainActor
+private func waitUntil(_ condition: () -> Bool) async {
+    for _ in 0..<200 where !condition() {
+        try? await Task.sleep(for: .milliseconds(10))
+    }
+}
+
+@Suite("AudioEngine — device parametric EQ")
+@MainActor
+struct AudioEngineDeviceEQTests {
+
+    @Test("TapInitialState carries the primary device's curve")
+    func initialStateCarriesCurve() throws {
+        let fix = makeFixture()
+        fix.engine.setDeviceEQ(roomCurve(), for: fix.device.uid)
+
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+
+        let snap = try #require(capturedInitial(fix))
+        #expect(snap.deviceEQ == roomCurve())
+    }
+
+    @Test("TapInitialState carries .flat when the device has no curve")
+    func initialStateFlatByDefault() throws {
+        let fix = makeFixture()
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+
+        let snap = try #require(capturedInitial(fix))
+        #expect(snap.deviceEQ == .flat)
+    }
+
+    @Test("setDeviceEQ updates only the taps playing to that device")
+    func setDeviceEQTargetsDevice() throws {
+        let fix = makeFixture()
+        let other = AudioDevice(id: AudioDeviceID(100), uid: "uid-other", name: "Other", icon: nil, supportsAutoEQ: false)
+        fix.deviceMonitor.addOutputDevice(other)
+        let secondApp = AudioApp(id: 777, processObjectIDs: [], name: "Second", icon: NSImage(), bundleID: "com.test.second")
+
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+        let firstTap = try #require(fix.lastTap())
+        fix.engine.setDevice(for: secondApp, deviceUID: other.uid)
+        let secondTap = try #require(fix.lastTap())
+
+        fix.engine.setDeviceEQ(roomCurve(), for: fix.device.uid)
+
+        #expect(firstTap.lastDeviceEQ == roomCurve())
+        #expect(secondTap.lastDeviceEQ == nil)
+    }
+
+    @Test("A rerouted tap receives the new device's curve")
+    func rerouteAppliesNewDeviceCurve() async throws {
+        let fix = makeFixture(supportsAutoEQ: false)
+        let other = AudioDevice(id: AudioDeviceID(100), uid: "uid-other", name: "Other", icon: nil, supportsAutoEQ: false)
+        fix.deviceMonitor.addOutputDevice(other)
+        fix.engine.setDeviceEQ(roomCurve(gainDB: 3), for: other.uid)
+
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+        let tap = try #require(fix.lastTap())
+        fix.engine.setDevice(for: fix.app, deviceUID: other.uid)
+
+        await waitUntil { tap.lastDeviceEQ != nil }
+        #expect(tap.currentDeviceUID == other.uid)
+        #expect(tap.lastDeviceEQ == roomCurve(gainDB: 3))
+    }
+
+    @Test("Device curve is re-applied when the device reconnects")
+    func curveReappliedOnReconnect() async throws {
+        let fix = makeFixture(supportsAutoEQ: false, isAlive: { _ in true })
+        var appSettings = fix.settings.appSettings
+        appSettings.showDeviceDisconnectAlerts = false  // no notification center in the test runner
+        fix.settings.updateAppSettings(appSettings)
+        let fallback = AudioDevice(id: AudioDeviceID(100), uid: "uid-fallback", name: "Speakers", icon: nil, supportsAutoEQ: false)
+        fix.deviceMonitor.addOutputDevice(fallback)
+        fix.settings.setDevicePriorityOrder([fix.device.uid, fallback.uid])
+        fix.engine.setDeviceEQ(roomCurve(), for: fix.device.uid)
+
+        // App pinned to the device: the tap starts with its curve.
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+        let tap = try #require(fix.lastTap())
+        #expect(try #require(capturedInitial(fix)).deviceEQ == roomCurve())
+
+        // Unplug: the tap falls back to the speakers, which have no curve.
+        fix.deviceMonitor.removeOutputDevice(uid: fix.device.uid)
+        fix.deviceMonitor.onDeviceDisconnected?(fix.device.uid, fix.device.name)
+        await waitUntil { tap.currentDeviceUID == fallback.uid && tap.lastDeviceEQ != nil }
+        #expect(tap.currentDeviceUID == fallback.uid)
+        #expect(tap.lastDeviceEQ == .flat)
+
+        // The stored curve is untouched while the device is gone.
+        #expect(fix.engine.getDeviceEQ(for: fix.device.uid) == roomCurve())
+
+        // Replug: the tap returns to the device and gets its curve back.
+        fix.deviceMonitor.addOutputDevice(fix.device)
+        fix.deviceMonitor.onDeviceConnected?(fix.device.uid, fix.device.name)
+        await waitUntil { tap.currentDeviceUID == fix.device.uid && tap.lastDeviceEQ == roomCurve() }
+        #expect(tap.currentDeviceUID == fix.device.uid)
+        #expect(tap.lastDeviceEQ == roomCurve())
+    }
+
+    @Test("Settings reset pushes .flat to every tap")
+    func resetPushesFlat() throws {
+        let fix = makeFixture()
+        fix.engine.setDeviceEQ(roomCurve(), for: fix.device.uid)
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+        let tap = try #require(fix.lastTap())
+
+        fix.engine.handleSettingsReset()
+
+        #expect(tap.events.contains(.updateDeviceEQ(.flat)))
+        #expect(fix.engine.getDeviceEQ(for: fix.device.uid) == .flat)
     }
 }
 

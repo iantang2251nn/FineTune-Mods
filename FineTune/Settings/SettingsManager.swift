@@ -138,8 +138,12 @@ final class SettingsManager {
         var favoriteAutoEQProfiles: Set<String> = []  // profile IDs
         var autoEQPreampEnabled: Bool = true  // Use profile preamp vs bypass (rely on limiter)
 
+        // Per-device parametric EQ (kept across disconnects so the curve returns on reconnect)
+        var deviceEQ: [String: ParametricEQSettings] = [:]  // deviceUID → device PEQ
+
         // User-created EQ presets (named EQ curves)
         var userEQPresets: [UserEQPreset] = []
+        var userParametricPresets: [UserParametricPreset] = []
 
         init() {}
 
@@ -188,6 +192,15 @@ final class SettingsManager {
             favoriteAutoEQProfiles = try c.decodeIfPresent(Set<String>.self, forKey: .favoriteAutoEQProfiles) ?? []
             autoEQPreampEnabled = try c.decodeIfPresent(Bool.self, forKey: .autoEQPreampEnabled) ?? true
             userEQPresets = try c.decodeIfPresent([UserEQPreset].self, forKey: .userEQPresets) ?? []
+            // try?: a malformed device-EQ entry must not reset every other setting.
+            deviceEQ = ((try? c.decodeIfPresent([String: ParametricEQSettings].self, forKey: .deviceEQ)) ?? [:])
+                .mapValues { $0.validated() }
+            userParametricPresets = ((try? c.decodeIfPresent([UserParametricPreset].self, forKey: .userParametricPresets)) ?? [])
+                .map { preset in
+                    var preset = preset
+                    preset.settings = preset.settings.validated()
+                    return preset
+                }
         }
     }
 
@@ -730,6 +743,21 @@ final class SettingsManager {
         }
     }
 
+    // MARK: - Per-Device Parametric EQ
+
+    /// The stored curve for a device, or `.flat` if none. Entries are never removed on
+    /// disconnect, so a device gets its curve back when it reconnects.
+    func getDeviceEQ(for deviceUID: String) -> ParametricEQSettings {
+        settings.deviceEQ[deviceUID] ?? .flat
+    }
+
+    /// Stores a validated copy: values are clamped, rounded and finite, so a bad value can
+    /// never make the settings file fail to encode.
+    func setDeviceEQ(_ eqSettings: ParametricEQSettings, for deviceUID: String) {
+        settings.deviceEQ[deviceUID] = eqSettings.validated()
+        scheduleSave()
+    }
+
     // MARK: - User EQ Presets
 
     /// Returns all user-created EQ presets, ordered by creation date (newest first).
@@ -745,7 +773,7 @@ final class SettingsManager {
     func createUserPreset(name: String, settings eqSettings: EQSettings) -> UserEQPreset {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let baseName = trimmed.isEmpty ? "Untitled" : trimmed
-        let finalName = uniquePresetName(baseName)
+        let finalName = Self.uniquePresetName(baseName, existingNames: settings.userEQPresets.map(\.name))
         let preset = UserEQPreset(name: finalName, settings: eqSettings)
         settings.userEQPresets.append(preset)
         scheduleSave()
@@ -759,23 +787,23 @@ final class SettingsManager {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         guard let index = settings.userEQPresets.firstIndex(where: { $0.id == id }) else { return }
-        let finalName = uniquePresetName(trimmed, excluding: id)
+        let finalName = Self.uniquePresetName(
+            trimmed,
+            existingNames: settings.userEQPresets.filter { $0.id != id }.map(\.name)
+        )
         settings.userEQPresets[index].name = finalName
         scheduleSave()
     }
 
     /// Generates a unique preset name by appending (2), (3), etc. if the name
-    /// already exists among user presets. Follows Finder duplicate naming convention.
+    /// already exists in `existingNames`. Follows Finder duplicate naming convention.
+    /// Shared by graphic and parametric presets.
     /// - Parameters:
     ///   - name: The desired base name.
-    ///   - excludeID: A preset ID to exclude from collision checks (used during rename).
+    ///   - existingNames: Names to avoid (callers exclude the preset being renamed).
     /// - Returns: A unique name, either the original or with a numeric suffix.
-    private func uniquePresetName(_ name: String, excluding excludeID: UUID? = nil) -> String {
-        let existingNames = Set(
-            settings.userEQPresets
-                .filter { $0.id != excludeID }
-                .map { $0.name }
-        )
+    private static func uniquePresetName(_ name: String, existingNames: [String]) -> String {
+        let existingNames = Set(existingNames)
         guard existingNames.contains(name) else { return name }
 
         var counter = 2
@@ -789,6 +817,44 @@ final class SettingsManager {
     /// Deletes a user preset by ID. No-op if the preset ID is not found.
     func deleteUserPreset(id: UUID) {
         settings.userEQPresets.removeAll { $0.id == id }
+        scheduleSave()
+    }
+
+    // MARK: - User Parametric Presets
+
+    /// Returns all user parametric presets, ordered by creation date (newest first).
+    func getParametricPresets() -> [UserParametricPreset] {
+        settings.userParametricPresets.sorted { $0.createdAt > $1.createdAt }
+    }
+
+    /// Creates a parametric preset from a device curve. Same naming rules as `createUserPreset`.
+    @discardableResult
+    func createParametricPreset(name: String, settings eqSettings: ParametricEQSettings) -> UserParametricPreset {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseName = trimmed.isEmpty ? "Untitled" : trimmed
+        let finalName = Self.uniquePresetName(baseName, existingNames: settings.userParametricPresets.map(\.name))
+        let preset = UserParametricPreset(name: finalName, settings: eqSettings.validated())
+        settings.userParametricPresets.append(preset)
+        scheduleSave()
+        return preset
+    }
+
+    /// Renames a parametric preset. Same rules as `updateUserPreset`.
+    func renameParametricPreset(id: UUID, name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard let index = settings.userParametricPresets.firstIndex(where: { $0.id == id }) else { return }
+        let finalName = Self.uniquePresetName(
+            trimmed,
+            existingNames: settings.userParametricPresets.filter { $0.id != id }.map(\.name)
+        )
+        settings.userParametricPresets[index].name = finalName
+        scheduleSave()
+    }
+
+    /// Deletes a parametric preset. Device curves applied from it are copies and stay intact.
+    func deleteParametricPreset(id: UUID) {
+        settings.userParametricPresets.removeAll { $0.id == id }
         scheduleSave()
     }
 
@@ -862,6 +928,8 @@ final class SettingsManager {
         settings.appDeviceSelectionMode.removeAll()
         settings.appSelectedDeviceUIDs.removeAll()
         settings.userEQPresets.removeAll()
+        settings.deviceEQ.removeAll()
+        settings.userParametricPresets.removeAll()
 
         // Also unregister from launch at login
         try? SMAppService.mainApp.unregister()

@@ -151,29 +151,61 @@ enum BiquadMath {
                 frequency = preWarpFrequency(frequency, from: profileOptimizedRate, to: sampleRate)
             }
 
-            // Bypass invalid or above-Nyquist filters (pre-warp can produce
-            // negative frequencies when the source filter is above its own Nyquist)
-            if frequency <= 0 || frequency >= sampleRate / 2.0 {
+            allCoeffs.append(contentsOf: coefficients(
+                type: filter.type, frequency: frequency,
+                gainDB: filter.gainDB, q: filter.q, sampleRate: sampleRate))
+        }
+
+        return allCoeffs
+    }
+
+    /// Compute one RBJ section of the given type. Shared by AutoEQ and the device parametric EQ.
+    /// Returns [b0, b1, b2, a1, a2] normalized by a0 for vDSP_biquad.
+    static func coefficients(
+        type: AutoEQFilter.FilterType,
+        frequency: Double,
+        gainDB: Float,
+        q: Double,
+        sampleRate: Double
+    ) -> [Double] {
+        // Bypass invalid or above-Nyquist filters (pre-warp can produce
+        // negative frequencies when the source filter is above its own Nyquist)
+        guard frequency > 0, frequency < sampleRate / 2.0 else {
+            return [1.0, 0.0, 0.0, 0.0, 0.0]
+        }
+
+        switch type {
+        case .peaking:
+            return peakingEQCoefficients(frequency: frequency, gainDB: gainDB, q: q, sampleRate: sampleRate)
+        case .lowShelf:
+            return lowShelfCoefficients(frequency: frequency, gainDB: gainDB, q: q, sampleRate: sampleRate)
+        case .highShelf:
+            return highShelfCoefficients(frequency: frequency, gainDB: gainDB, q: q, sampleRate: sampleRate)
+        }
+    }
+
+    /// Compute coefficients for the device parametric EQ: exactly `ParametricEQSettings.bandCount`
+    /// sections, band i in section i, so toggling a band never shifts filter state between sections.
+    /// Band types come from their position; a disabled band is an identity section.
+    /// PEQ bands are designed at the device's actual sample rate, so there is no pre-warp.
+    static func coefficientsForParametricBands(
+        _ bands: [ParametricBand],
+        sampleRate: Double
+    ) -> [Double] {
+        var allCoeffs: [Double] = []
+        allCoeffs.reserveCapacity(ParametricEQSettings.bandCount * 5)
+
+        for index in 0..<ParametricEQSettings.bandCount {
+            // A 0 dB band is identity for all three RBJ types (A = 1). Emitting an exact identity
+            // section avoids the float32 rounding a b == a section adds near its center frequency.
+            guard index < bands.count, bands[index].isEnabled, bands[index].gainDB != 0 else {
                 allCoeffs.append(contentsOf: [1.0, 0.0, 0.0, 0.0, 0.0])
                 continue
             }
-
-            let coeffs: [Double]
-            switch filter.type {
-            case .peaking:
-                coeffs = peakingEQCoefficients(
-                    frequency: frequency, gainDB: filter.gainDB,
-                    q: filter.q, sampleRate: sampleRate)
-            case .lowShelf:
-                coeffs = lowShelfCoefficients(
-                    frequency: frequency, gainDB: filter.gainDB,
-                    q: filter.q, sampleRate: sampleRate)
-            case .highShelf:
-                coeffs = highShelfCoefficients(
-                    frequency: frequency, gainDB: filter.gainDB,
-                    q: filter.q, sampleRate: sampleRate)
-            }
-            allCoeffs.append(contentsOf: coeffs)
+            let band = bands[index]
+            allCoeffs.append(contentsOf: coefficients(
+                type: ParametricEQSettings.type(ofBand: index), frequency: band.frequency,
+                gainDB: band.gainDB, q: band.q, sampleRate: sampleRate))
         }
 
         return allCoeffs

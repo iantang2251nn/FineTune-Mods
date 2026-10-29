@@ -104,6 +104,7 @@ private func processWithDefaults(
     preferredStereoRight: Int = 1,
     currentVol: inout Float,
     eqProc: EQProcessor? = nil,
+    deviceEQProc: ParametricEQProcessor? = nil,
     autoEQProc: AutoEQProcessor? = nil,
     loudnessEqualizerProc: LoudnessEqualizer? = nil,
     loudnessCompensatorProc: LoudnessCompensator? = nil,
@@ -121,6 +122,7 @@ private func processWithDefaults(
         preferredStereoRight: preferredStereoRight,
         currentVol: &currentVol,
         eqProc: eqProc,
+        deviceEQProc: deviceEQProc,
         autoEQProc: autoEQProc,
         loudnessEqualizerProc: loudnessEqualizerProc,
         loudnessCompensatorProc: loudnessCompensatorProc,
@@ -1121,6 +1123,100 @@ struct EQBufferLayoutTests {
         await withCheckedContinuation { continuation in
             resources.destroyAsync { continuation.resume() }
             #expect(resources.stereoScratch == nil)
+        }
+    }
+}
+
+// MARK: - Device Parametric EQ in the Chain
+
+@Suite("ProcessTapController — device parametric EQ stage")
+struct DeviceEQChainTests {
+
+    /// Streams a sine through `processMappedBuffers` in 512-frame callbacks and returns the
+    /// settled gain (dB) over the second half, plus the output's peak and finiteness.
+    private func stream(
+        frequency: Double,
+        amplitude: Float,
+        eqProc: EQProcessor?,
+        deviceEQProc: ParametricEQProcessor?
+    ) -> (gainDB: Double, peak: Float, allFinite: Bool) {
+        let sampleRate = 48000.0
+        let frames = 512
+        let callbacks = 200
+        var inSq = 0.0, outSq = 0.0
+        var peak: Float = 0
+        var allFinite = true
+        var vol: Float = 1.0
+        for callback in 0..<callbacks {
+            let input = TestABL(buffers: [(channels: 2, frames: frames)])
+            let output = TestABL(buffers: [(channels: 2, frames: frames)])
+            for i in 0..<frames {
+                let t = Double(callback * frames + i)
+                let v = amplitude * Float(sin(2 * Double.pi * frequency * t / sampleRate))
+                input.data(at: 0)[i * 2] = v
+                input.data(at: 0)[i * 2 + 1] = v
+            }
+            processWithDefaults(input: input, output: output, currentVol: &vol, eqProc: eqProc, deviceEQProc: deviceEQProc)
+            for i in 0..<(frames * 2) {
+                let o = output.data(at: 0)[i]
+                allFinite = allFinite && o.isFinite
+                peak = max(peak, abs(o))
+                if callback >= callbacks / 2 {
+                    inSq += Double(input.data(at: 0)[i]) * Double(input.data(at: 0)[i])
+                    outSq += Double(o) * Double(o)
+                }
+            }
+        }
+        return (10 * log10(outSq / inSq), peak, allFinite)
+    }
+
+    @Test("App EQ −12 dB at 125 Hz stacked with device PEQ −12 dB at 125 Hz, Q 1.4: about −24 dB")
+    func appAndDeviceEQStack() {
+        var gains = [Float](repeating: 0, count: 10)
+        gains[2] = -12
+        let eq = EQProcessor(sampleRate: 48000)
+        eq.updateSettings(EQSettings(bandGains: gains, isEnabled: true))
+        var device = ParametricEQSettings()
+        device.bands[2] = ParametricBand(frequency: 125, gainDB: -12, q: 1.4)
+        let deviceEQ = ParametricEQProcessor(sampleRate: 48000)
+        deviceEQ.updateSettings(device)
+
+        let result = stream(frequency: 125, amplitude: 0.5, eqProc: eq, deviceEQProc: deviceEQ)
+        #expect(abs(result.gainDB - -24) < 0.5, "Stacked gain \(result.gainDB) dB")
+    }
+
+    @Test("+12 dB everywhere on both EQs plus +12 dB output, full-scale input: finite and under the ceiling")
+    func extremeBoostStaysBounded() {
+        let eq = EQProcessor(sampleRate: 48000)
+        eq.updateSettings(EQSettings(bandGains: [Float](repeating: 12, count: 10), isEnabled: true))
+        var device = ParametricEQSettings()
+        for i in 0..<ParametricEQSettings.bandCount { device.bands[i].gainDB = 12 }
+        device.outputGainDB = 12
+        let deviceEQ = ParametricEQProcessor(sampleRate: 48000)
+        deviceEQ.updateSettings(device)
+
+        let result = stream(frequency: 1000, amplitude: 1.0, eqProc: eq, deviceEQProc: deviceEQ)
+        #expect(result.allFinite)
+        #expect(result.peak <= SoftLimiter.ceiling)
+    }
+
+    @Test("Flat device PEQ: output bit-identical to no device PEQ")
+    func flatDeviceEQIsBitExact() {
+        let frames = 1024
+        let input = TestABL(buffers: [(channels: 2, frames: frames)])
+        for i in 0..<(frames * 2) { input.data(at: 0)[i] = Float(0.3 * sin(Double(i) * 0.05)) }
+        let withFlat = TestABL(buffers: [(channels: 2, frames: frames)])
+        let without = TestABL(buffers: [(channels: 2, frames: frames)])
+        let deviceEQ = ParametricEQProcessor(sampleRate: 48000)
+        deviceEQ.updateSettings(.flat)
+        #expect(!deviceEQ.isEnabled)
+
+        var vol1: Float = 1.0, vol2: Float = 1.0
+        processWithDefaults(input: input, output: withFlat, currentVol: &vol1, eqProc: makeBoostedEQ(), deviceEQProc: deviceEQ)
+        processWithDefaults(input: input, output: without, currentVol: &vol2, eqProc: makeBoostedEQ())
+
+        for i in 0..<(frames * 2) {
+            #expect(withFlat.data(at: 0)[i] == without.data(at: 0)[i], "sample \(i)")
         }
     }
 }

@@ -231,21 +231,25 @@ final class AudioEngine {
             self.tapFactory = factory
         } else {
             self.tapFactory = { app, deviceUIDs, preferredSource in
+                let controller: ProcessTapController
                 if deviceUIDs.count == 1 {
-                    return ProcessTapController(
+                    controller = ProcessTapController(
                         app: app,
                         targetDeviceUID: deviceUIDs[0],
                         deviceMonitor: realDeviceMonitor,
                         preferredTapSourceDeviceUID: preferredSource
                     )
                 } else {
-                    return ProcessTapController(
+                    controller = ProcessTapController(
                         app: app,
                         targetDeviceUIDs: deviceUIDs,
                         deviceMonitor: realDeviceMonitor,
                         preferredTapSourceDeviceUID: preferredSource
                     )
                 }
+                // `self` isn't available yet; capture the settings manager directly.
+                controller.deviceEQProvider = { uid in manager.getDeviceEQ(for: uid) }
+                return controller
             }
         }
 
@@ -626,6 +630,7 @@ final class AudioEngine {
         for tap in taps.values {
             applyTapOutputState(to: tap, for: tap.app.id, deviceUIDs: tap.currentDeviceUIDs)
             tap.updateEQSettings(.flat)
+            tap.updateDeviceEQ(.flat)
             tap.updateAutoEQProfile(nil)
             tap.updateLoudnessCompensation(volume: effectiveLoudnessVolume(for: tap), enabled: false)
         }
@@ -756,6 +761,21 @@ final class AudioEngine {
         return settingsManager.getEQSettings(for: app.persistenceIdentifier)
     }
 
+    // MARK: - Per-Device Parametric EQ
+
+    func getDeviceEQ(for deviceUID: String) -> ParametricEQSettings {
+        settingsManager.getDeviceEQ(for: deviceUID)
+    }
+
+    /// Persists the curve and applies it to every tap whose primary output is the device.
+    func setDeviceEQ(_ settings: ParametricEQSettings, for deviceUID: String) {
+        settingsManager.setDeviceEQ(settings, for: deviceUID)
+        let stored = settingsManager.getDeviceEQ(for: deviceUID)
+        for tap in taps.values where tap.currentDeviceUID == deviceUID {
+            tap.updateDeviceEQ(stored)
+        }
+    }
+
     // MARK: - Per-Device AutoEQ
 
     func getAutoEQProfile(for deviceUID: String) -> AutoEQProfile? {
@@ -828,12 +848,28 @@ final class AudioEngine {
         loudnessEqSettings.enabled = settingsManager.appSettings.loudnessEqualizationEnabled
         return TapInitialState(
             eqSettings: settingsManager.getEQSettings(for: app.persistenceIdentifier),
+            deviceEQ: settingsManager.getDeviceEQ(for: primaryDeviceUID),
             autoEQProfile: autoEQProfileForActivation(deviceUID: primaryDeviceUID),
             autoEQPreampEnabled: settingsManager.autoEQPreampEnabled,
             loudnessVolume: deviceVolume * volumeState.getVolume(for: app.id),
             loudnessCompensationEnabled: settingsManager.appSettings.loudnessCompensationEnabled,
             loudnessEqualizerSettings: loudnessEqSettings
         )
+    }
+
+    /// Re-applies the per-device stages (AutoEQ, then device EQ) after a tap moved to another
+    /// output, including a device that just reconnected. Safety net: the switch already started
+    /// the new tap with the target device's curve via `deviceEQProvider`; this also catches
+    /// curve edits made during the crossfade, which only reached the old processor.
+    private func applyDeviceProcessing(to tap: any ProcessTapControlling) {
+        applyAutoEQToTap(tap)
+        applyDeviceEQToTap(tap)
+    }
+
+    /// Pushes the stored curve of the tap's primary output to the tap.
+    private func applyDeviceEQToTap(_ tap: any ProcessTapControlling) {
+        guard let deviceUID = tap.currentDeviceUID else { return }
+        tap.updateDeviceEQ(settingsManager.getDeviceEQ(for: deviceUID))
     }
 
     /// Skips AutoEQ entirely for devices that don't support it (speakers, HDMI, etc.).
@@ -944,7 +980,7 @@ final class AudioEngine {
                 do {
                     try await tap.switchDevice(to: targetUID, preferredTapSourceDeviceUID: preferredTapSourceUID)
                     self.applyTapOutputState(to: tap, for: app.id, deviceUIDs: [targetUID])
-                    self.applyAutoEQToTap(tap)
+                    self.applyDeviceProcessing(to: tap)
                     self.logger.debug("Switched \(app.name) to device: \(targetUID)")
                 } catch {
                     self.logger.error("Failed to switch device for \(app.name): \(error.localizedDescription)")
@@ -1037,6 +1073,7 @@ final class AudioEngine {
                     let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: deviceUIDs, isFollowsDefault: followsDefault.contains(app.id))
                     try await tap.updateDevices(to: deviceUIDs, preferredTapSourceDeviceUID: preferredTapSourceUID)
                     applyTapOutputState(to: tap, for: app.id, deviceUIDs: deviceUIDs)
+                    applyDeviceEQToTap(tap)
                     logger.debug("Updated \(app.name) to \(deviceUIDs.count) device(s)")
                 } catch {
                     logger.error("Failed to update devices for \(app.name): \(error.localizedDescription)")
@@ -1180,7 +1217,7 @@ final class AudioEngine {
                     do {
                         try await existingTap.switchDevice(to: deviceUID, preferredTapSourceDeviceUID: preferredSource)
                         self.applyTapOutputState(to: existingTap, for: app.id, deviceUIDs: [deviceUID])
-                        self.applyAutoEQToTap(existingTap)
+                        self.applyDeviceProcessing(to: existingTap)
                     } catch {
                         self.logger.error("Failed to re-route \(app.name) to \(deviceUID): \(error.localizedDescription)")
                     }
@@ -1325,7 +1362,7 @@ final class AudioEngine {
                     let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: [targetUID], isFollowsDefault: true)
                     try await tap.switchDevice(to: targetUID, preferredTapSourceDeviceUID: preferredTapSourceUID)
                     self.applyTapOutputState(to: tap, for: app.id, deviceUIDs: [targetUID])
-                    self.applyAutoEQToTap(tap)
+                    self.applyDeviceProcessing(to: tap)
                 } catch {
                     self.logger.error("Failed to switch \(app.name) to \(targetUID): \(error.localizedDescription)")
                 }
@@ -1405,7 +1442,7 @@ final class AudioEngine {
                         let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: [fallbackUID], isFollowsDefault: true)
                         try await tap.switchDevice(to: fallbackUID, preferredTapSourceDeviceUID: preferredTapSourceUID, sourceDeviceDead: true)
                         self.applyTapOutputState(to: tap, for: tap.app.id, deviceUIDs: [fallbackUID])
-                        self.applyAutoEQToTap(tap)
+                        self.applyDeviceProcessing(to: tap)
                     } catch {
                         self.logger.error("Failed to switch \(tap.app.name) to fallback: \(error.localizedDescription)")
                     }
@@ -1418,6 +1455,7 @@ final class AudioEngine {
                         let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: remainingUIDs, isFollowsDefault: self.followsDefault.contains(tap.app.id))
                         try await tap.updateDevices(to: remainingUIDs, preferredTapSourceDeviceUID: preferredTapSourceUID, sourceDeviceDead: true)
                         self.applyTapOutputState(to: tap, for: tap.app.id, deviceUIDs: remainingUIDs)
+                        self.applyDeviceEQToTap(tap)
                         self.logger.debug("Removed \(deviceName) from \(tap.app.name) multi-device output")
                     } catch {
                         self.logger.error("Failed to update \(tap.app.name) devices: \(error.localizedDescription)")
@@ -1477,7 +1515,7 @@ final class AudioEngine {
                         let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: [deviceUID], isFollowsDefault: false)
                         try await tap.switchDevice(to: deviceUID, preferredTapSourceDeviceUID: preferredTapSourceUID)
                         self.applyTapOutputState(to: tap, for: tap.app.id, deviceUIDs: [deviceUID])
-                        self.applyAutoEQToTap(tap)
+                        self.applyDeviceProcessing(to: tap)
                     } catch {
                         self.logger.error("Failed to switch \(tap.app.name) back to \(deviceName): \(error.localizedDescription)")
                     }

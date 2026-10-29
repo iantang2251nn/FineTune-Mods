@@ -28,6 +28,7 @@ private struct BiquadSetupBox: @unchecked Sendable {
 /// ## Subclasses
 /// - `EQProcessor`: Per-app 10-band graphic EQ
 /// - `AutoEQProcessor`: Per-device headphone correction
+/// - `ParametricEQProcessor`: Per-device parametric EQ
 class BiquadProcessor: @unchecked Sendable, BiquadProcessable {
 
     let logger: Logger
