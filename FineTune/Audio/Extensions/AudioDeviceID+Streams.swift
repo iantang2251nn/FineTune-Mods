@@ -108,6 +108,12 @@ nonisolated extension AudioDeviceID {
     /// Returns the total number of output channels reported by the device's
     /// stream configuration (sum of all output buffers).
     func outputChannelCount() -> Int {
+        outputBufferChannelCounts().reduce(0, +)
+    }
+
+    /// Returns the channel count of each output buffer in the device's stream
+    /// configuration, in IO-proc buffer order. Empty if the property can't be read.
+    func outputBufferChannelCounts() -> [Int] {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyStreamConfiguration,
             mScope: kAudioObjectPropertyScopeOutput,
@@ -117,7 +123,7 @@ nonisolated extension AudioDeviceID {
         var size: UInt32 = 0
         let sizeErr = AudioObjectGetPropertyDataSize(self, &address, 0, nil, &size)
         guard sizeErr == noErr, size >= UInt32(MemoryLayout<AudioBufferList>.size) else {
-            return 0
+            return []
         }
 
         let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment)
@@ -126,9 +132,9 @@ nonisolated extension AudioDeviceID {
         let list = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
         var mutableSize = size
         let dataErr = AudioObjectGetPropertyData(self, &address, 0, nil, &mutableSize, list)
-        guard dataErr == noErr else { return 0 }
+        guard dataErr == noErr else { return [] }
 
         let bufferList = UnsafeMutableAudioBufferListPointer(list)
-        return bufferList.reduce(0) { $0 + Int($1.mNumberChannels) }
+        return bufferList.map { Int($0.mNumberChannels) }
     }
 }

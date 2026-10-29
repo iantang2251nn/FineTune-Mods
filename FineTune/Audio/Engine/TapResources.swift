@@ -19,6 +19,8 @@ nonisolated struct TapResources {
     var aggregateDeviceID: AudioObjectID = .unknown
     var deviceProcID: AudioDeviceIOProcID?
     var tapDescription: CATapDescription?
+    /// Scratch used only by this resource set's IO proc. Freed after that IO proc is destroyed.
+    var stereoScratch: StereoScratchBuffer?
 
     /// Whether these resources are currently active
     var isActive: Bool {
@@ -33,6 +35,7 @@ nonisolated struct TapResources {
         let tID = tapID
 
         // Step 1 & 2: Stop and destroy IO proc
+        var ioProcDestroyed = true
         if aggID.isValid {
             if let procID = deviceProcID {
                 let stopErr = AudioDeviceStop(aggID, procID)
@@ -42,10 +45,17 @@ nonisolated struct TapResources {
                 let destroyProcErr = AudioDeviceDestroyIOProcID(aggID, procID)
                 if destroyProcErr != noErr {
                     Self.logger.error("AudioDeviceDestroyIOProcID failed for aggregate \(aggID): OSStatus \(destroyProcErr)")
+                    ioProcDestroyed = false
                 }
             }
         }
         deviceProcID = nil
+
+        // A proc that failed to destroy may still run: leak its scratch rather than free it under the callback.
+        if ioProcDestroyed {
+            stereoScratch?.deallocate()
+        }
+        stereoScratch = nil
 
         // Step 3: Destroy aggregate device
         if aggID.isValid {
@@ -83,16 +93,19 @@ nonisolated struct TapResources {
         let capturedTapID = tapID
         let capturedAggregateID = aggregateDeviceID
         let capturedProcID = deviceProcID
+        let capturedScratch = stereoScratch
 
         // Clear instance state immediately
         tapID = .unknown
         aggregateDeviceID = .unknown
         deviceProcID = nil
         tapDescription = nil
+        stereoScratch = nil
 
         // Dispatch blocking teardown to background
         queue.async {
             // Step 1 & 2: Stop and destroy IO proc
+            var ioProcDestroyed = true
             if capturedAggregateID.isValid, let procID = capturedProcID {
                 let stopErr = AudioDeviceStop(capturedAggregateID, procID)
                 if stopErr != noErr {
@@ -101,7 +114,11 @@ nonisolated struct TapResources {
                 let destroyProcErr = AudioDeviceDestroyIOProcID(capturedAggregateID, procID)
                 if destroyProcErr != noErr {
                     Self.logger.error("AudioDeviceDestroyIOProcID failed for aggregate \(capturedAggregateID): OSStatus \(destroyProcErr)")
+                    ioProcDestroyed = false
                 }
+            }
+            if ioProcDestroyed {
+                capturedScratch?.deallocate()
             }
 
             // Step 3: Destroy aggregate device
@@ -123,5 +140,24 @@ nonisolated struct TapResources {
 
             completion?()
         }
+    }
+}
+
+/// Stereo-interleaved scratch the IO callback gathers the EQ pair into when the
+/// output buffer isn't 2-channel interleaved. Each IO proc captures its own buffer,
+/// so the primary and secondary callbacks never share one during a crossfade.
+nonisolated struct StereoScratchBuffer: @unchecked Sendable {
+    static let frameCapacity = 4096
+
+    let samples: UnsafeMutablePointer<Float>
+
+    static func allocate() -> StereoScratchBuffer {
+        let samples = UnsafeMutablePointer<Float>.allocate(capacity: frameCapacity * 2)
+        samples.initialize(repeating: 0, count: frameCapacity * 2)
+        return StereoScratchBuffer(samples: samples)
+    }
+
+    func deallocate() {
+        samples.deallocate()
     }
 }

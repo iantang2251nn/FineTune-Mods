@@ -106,7 +106,9 @@ private func processWithDefaults(
     eqProc: EQProcessor? = nil,
     autoEQProc: AutoEQProcessor? = nil,
     loudnessEqualizerProc: LoudnessEqualizer? = nil,
-    loudnessCompensatorProc: LoudnessCompensator? = nil
+    loudnessCompensatorProc: LoudnessCompensator? = nil,
+    stereoScratch: UnsafeMutablePointer<Float>? = nil,
+    scratchFrames: Int = 0
 ) {
     ProcessTapController.processMappedBuffers(
         inputBuffers: input.bufferList,
@@ -121,7 +123,9 @@ private func processWithDefaults(
         eqProc: eqProc,
         autoEQProc: autoEQProc,
         loudnessEqualizerProc: loudnessEqualizerProc,
-        loudnessCompensatorProc: loudnessCompensatorProc
+        loudnessCompensatorProc: loudnessCompensatorProc,
+        stereoScratch: stereoScratch,
+        scratchFrames: scratchFrames
     )
 }
 
@@ -841,6 +845,282 @@ struct ProcessingChainTests {
         for i in trailingStart..<(outputFrames * 2) {
             #expect(outData[i] == 0.0,
                     "Trailing sample \(i) should be zeroed, got \(outData[i])")
+        }
+    }
+}
+
+// MARK: - EQ on Every Buffer Layout
+
+/// Non-flat graphic EQ so any processing is visible in the output.
+private func makeBoostedEQ(sampleRate: Double = 48000) -> EQProcessor {
+    let eq = EQProcessor(sampleRate: sampleRate)
+    eq.updateSettings(EQSettings(bandGains: [6, -6, 9, 0, -9, 6, 0, 3, -3, 6], isEnabled: true))
+    return eq
+}
+
+/// Deterministic test signal, distinct per channel, peaking well below the limiter threshold.
+private func testSample(frame: Int, channel: Int) -> Float {
+    let t = Double(frame)
+    return Float(0.3 * sin(t * (0.05 + 0.01 * Double(channel))) + 0.1 * sin(t * 0.37 + Double(channel)))
+}
+
+/// Runs a fresh reference EQ over stereo interleaved samples in one call (the pre-change path).
+private func referenceEQ(_ stereo: [Float]) -> [Float] {
+    var samples = stereo
+    let eq = makeBoostedEQ()
+    samples.withUnsafeMutableBufferPointer { buf in
+        eq.process(input: buf.baseAddress!, output: buf.baseAddress!, frameCount: buf.count / 2)
+        SoftLimiter.processBuffer(buf.baseAddress!, sampleCount: buf.count)
+    }
+    return samples
+}
+
+@Suite("ProcessTapController — EQ on every buffer layout")
+struct EQBufferLayoutTests {
+
+    @Test("All processors nil: 2→2, 1→2, 2→6 and 6→6 match the plain channel mapping")
+    func nilProcessorsMatchMapping() {
+        let frames = 512
+        let scratch = StereoScratchBuffer.allocate()
+        defer { scratch.deallocate() }
+
+        for (inChannels, outChannels) in [(2, 2), (1, 2), (2, 6), (6, 6)] {
+            let input = TestABL(buffers: [(channels: UInt32(inChannels), frames: frames)])
+            let output = TestABL(buffers: [(channels: UInt32(outChannels), frames: frames)])
+            let inData = input.data(at: 0)
+            for f in 0..<frames {
+                for ch in 0..<inChannels { inData[f * inChannels + ch] = testSample(frame: f, channel: ch) }
+            }
+
+            // Channels 3/4 for the 6-channel upmix; the default pair elsewhere.
+            let preferred = outChannels == 6 ? (left: 2, right: 3) : (left: 0, right: 1)
+            var vol: Float = 1.0
+            processWithDefaults(
+                input: input, output: output,
+                preferredStereoLeft: preferred.left, preferredStereoRight: preferred.right,
+                currentVol: &vol,
+                stereoScratch: scratch.samples, scratchFrames: StereoScratchBuffer.frameCapacity
+            )
+
+            let outData = output.data(at: 0)
+            for f in 0..<frames {
+                for ch in 0..<outChannels {
+                    let expected: Float
+                    switch (inChannels, outChannels) {
+                    case (1, 2): expected = inData[f]
+                    case (2, 6): expected = ch == 2 ? inData[f * 2] : (ch == 3 ? inData[f * 2 + 1] : 0)
+                    default: expected = inData[f * inChannels + ch]
+                    }
+                    #expect(outData[f * outChannels + ch] == expected,
+                            "\(inChannels)→\(outChannels) frame \(f) ch \(ch)")
+                }
+            }
+        }
+    }
+
+    @Test("Case A (2-channel) with app EQ: bit-identical to running the EQ on the buffer directly")
+    func caseAMatchesDirectEQ() {
+        let frames = 1024
+        let input = TestABL(buffers: [(channels: 2, frames: frames)])
+        let output = TestABL(buffers: [(channels: 2, frames: frames)])
+        let inData = input.data(at: 0)
+        var stereo = [Float](repeating: 0, count: frames * 2)
+        for f in 0..<frames {
+            for ch in 0..<2 {
+                inData[f * 2 + ch] = testSample(frame: f, channel: ch)
+                stereo[f * 2 + ch] = inData[f * 2 + ch]
+            }
+        }
+
+        var vol: Float = 1.0
+        processWithDefaults(input: input, output: output, currentVol: &vol, eqProc: makeBoostedEQ())
+
+        let expected = referenceEQ(stereo)
+        let outData = output.data(at: 0)
+        for i in 0..<(frames * 2) {
+            #expect(outData[i] == expected[i], "sample \(i)")
+        }
+    }
+
+    @Test("Case B (8-channel interleaved): the preferred pair is processed, other channels untouched",
+          arguments: [(0, 1), (2, 3)])
+    func caseBProcessesPreferredPair(pair: (left: Int, right: Int)) {
+        let frames = 1024
+        let channels = 8
+        let input = TestABL(buffers: [(channels: UInt32(channels), frames: frames)])
+        let output = TestABL(buffers: [(channels: UInt32(channels), frames: frames)])
+        let inData = input.data(at: 0)
+        var stereo = [Float](repeating: 0, count: frames * 2)
+        for f in 0..<frames {
+            for ch in 0..<channels { inData[f * channels + ch] = testSample(frame: f, channel: ch) }
+            stereo[f * 2] = inData[f * channels + pair.left]
+            stereo[f * 2 + 1] = inData[f * channels + pair.right]
+        }
+        let scratch = StereoScratchBuffer.allocate()
+        defer { scratch.deallocate() }
+
+        var vol: Float = 1.0
+        processWithDefaults(
+            input: input, output: output,
+            preferredStereoLeft: pair.left, preferredStereoRight: pair.right,
+            currentVol: &vol, eqProc: makeBoostedEQ(),
+            stereoScratch: scratch.samples, scratchFrames: StereoScratchBuffer.frameCapacity
+        )
+
+        let expected = referenceEQ(stereo)
+        let outData = output.data(at: 0)
+        for f in 0..<frames {
+            for ch in 0..<channels {
+                let got = outData[f * channels + ch]
+                if ch == pair.left {
+                    #expect(got == expected[f * 2], "frame \(f) left")
+                } else if ch == pair.right {
+                    #expect(got == expected[f * 2 + 1], "frame \(f) right")
+                } else {
+                    #expect(got == inData[f * channels + ch], "frame \(f) ch \(ch) must be untouched")
+                }
+            }
+        }
+    }
+
+    @Test("Case C (two mono buffers): processed as one stereo pair")
+    func caseCProcessesSplitMono() {
+        let frames = 1024
+        let input = TestABL(buffers: [(channels: 1, frames: frames), (channels: 1, frames: frames)])
+        let output = TestABL(buffers: [(channels: 1, frames: frames), (channels: 1, frames: frames)])
+        var stereo = [Float](repeating: 0, count: frames * 2)
+        for f in 0..<frames {
+            input.data(at: 0)[f] = testSample(frame: f, channel: 0)
+            input.data(at: 1)[f] = testSample(frame: f, channel: 1)
+            stereo[f * 2] = input.data(at: 0)[f]
+            stereo[f * 2 + 1] = input.data(at: 1)[f]
+        }
+        let scratch = StereoScratchBuffer.allocate()
+        defer { scratch.deallocate() }
+
+        var vol: Float = 1.0
+        processWithDefaults(
+            input: input, output: output,
+            currentVol: &vol, eqProc: makeBoostedEQ(),
+            stereoScratch: scratch.samples, scratchFrames: StereoScratchBuffer.frameCapacity
+        )
+
+        let expected = referenceEQ(stereo)
+        for f in 0..<frames {
+            #expect(output.data(at: 0)[f] == expected[f * 2], "frame \(f) left")
+            #expect(output.data(at: 1)[f] == expected[f * 2 + 1], "frame \(f) right")
+        }
+    }
+
+    @Test("Case D (lone mono buffer): passthrough, no crash")
+    func caseDPassthrough() {
+        let frames = 256
+        let input = TestABL(buffers: [(channels: 1, frames: frames)])
+        let output = TestABL(buffers: [(channels: 1, frames: frames)])
+        for f in 0..<frames { input.data(at: 0)[f] = testSample(frame: f, channel: 0) }
+        let scratch = StereoScratchBuffer.allocate()
+        defer { scratch.deallocate() }
+
+        var vol: Float = 1.0
+        processWithDefaults(
+            input: input, output: output,
+            currentVol: &vol, eqProc: makeBoostedEQ(),
+            stereoScratch: scratch.samples, scratchFrames: StereoScratchBuffer.frameCapacity
+        )
+
+        for f in 0..<frames {
+            #expect(output.data(at: 0)[f] == input.data(at: 0)[f], "frame \(f)")
+        }
+    }
+
+    @Test("Two 2-channel output buffers: EQ runs once, on buffer 0 only")
+    func twoStereoBuffersRunEQOnce() {
+        let frames = 1024
+        let input = TestABL(buffers: [(channels: 2, frames: frames), (channels: 2, frames: frames)])
+        let output = TestABL(buffers: [(channels: 2, frames: frames), (channels: 2, frames: frames)])
+        var stereo = [Float](repeating: 0, count: frames * 2)
+        for i in 0..<(frames * 2) {
+            input.data(at: 0)[i] = testSample(frame: i / 2, channel: i % 2)
+            input.data(at: 1)[i] = testSample(frame: i / 2, channel: 2 + i % 2)
+            stereo[i] = input.data(at: 0)[i]
+        }
+
+        var vol: Float = 1.0
+        processWithDefaults(input: input, output: output, currentVol: &vol, eqProc: makeBoostedEQ())
+
+        let expected = referenceEQ(stereo)
+        for i in 0..<(frames * 2) {
+            #expect(output.data(at: 0)[i] == expected[i], "buffer 0 sample \(i)")
+            #expect(output.data(at: 1)[i] == input.data(at: 1)[i], "buffer 1 sample \(i) must be unprocessed")
+        }
+    }
+
+    @Test("frameCount larger than scratchFrames: chunked result matches an unchunked reference")
+    func chunkedMatchesUnchunked() {
+        let frames = 10_000  // > 2 × 4096 chunks, with a partial last chunk
+        let channels = 4
+        let input = TestABL(buffers: [(channels: UInt32(channels), frames: frames)])
+        let output = TestABL(buffers: [(channels: UInt32(channels), frames: frames)])
+        let inData = input.data(at: 0)
+        var stereo = [Float](repeating: 0, count: frames * 2)
+        for f in 0..<frames {
+            for ch in 0..<channels { inData[f * channels + ch] = testSample(frame: f, channel: ch) }
+            stereo[f * 2] = inData[f * channels + 2]
+            stereo[f * 2 + 1] = inData[f * channels + 3]
+        }
+        let scratch = StereoScratchBuffer.allocate()
+        defer { scratch.deallocate() }
+
+        var vol: Float = 1.0
+        processWithDefaults(
+            input: input, output: output,
+            preferredStereoLeft: 2, preferredStereoRight: 3,
+            currentVol: &vol, eqProc: makeBoostedEQ(),
+            stereoScratch: scratch.samples, scratchFrames: StereoScratchBuffer.frameCapacity
+        )
+
+        let expected = referenceEQ(stereo)
+        let outData = output.data(at: 0)
+        var maxError: Float = 0
+        for f in 0..<frames {
+            maxError = max(maxError, abs(outData[f * channels + 2] - expected[f * 2]))
+            maxError = max(maxError, abs(outData[f * channels + 3] - expected[f * 2 + 1]))
+        }
+        #expect(maxError < 1e-6, "Chunk seams must not change the output. Max error: \(maxError)")
+    }
+
+    @Test("Without scratch, gathered layouts bypass the EQ chain")
+    func noScratchBypassesGatheredLayouts() {
+        let frames = 256
+        let channels = 4
+        let input = TestABL(buffers: [(channels: UInt32(channels), frames: frames)])
+        let output = TestABL(buffers: [(channels: UInt32(channels), frames: frames)])
+        let inData = input.data(at: 0)
+        for i in 0..<(frames * channels) { inData[i] = testSample(frame: i / channels, channel: i % channels) }
+
+        var vol: Float = 1.0
+        processWithDefaults(input: input, output: output, currentVol: &vol, eqProc: makeBoostedEQ())
+
+        for i in 0..<(frames * channels) {
+            #expect(output.data(at: 0)[i] == inData[i], "sample \(i)")
+        }
+    }
+
+    @Test("TapResources.destroy() releases the IO proc's scratch")
+    func destroyReleasesScratch() {
+        var resources = TapResources()
+        resources.stereoScratch = StereoScratchBuffer.allocate()
+        resources.destroy()
+        #expect(resources.stereoScratch == nil)
+    }
+
+    @Test("TapResources.destroyAsync() hands the scratch to the teardown and clears it immediately")
+    func destroyAsyncReleasesScratch() async {
+        var resources = TapResources()
+        resources.stereoScratch = StereoScratchBuffer.allocate()
+        await withCheckedContinuation { continuation in
+            resources.destroyAsync { continuation.resume() }
+            #expect(resources.stereoScratch == nil)
         }
     }
 }

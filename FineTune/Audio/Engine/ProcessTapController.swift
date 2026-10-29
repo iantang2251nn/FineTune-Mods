@@ -155,7 +155,6 @@ final class ProcessTapController: ProcessTapControlling {
     private var isSwitching = false
     /// Cancellable crossfade task — cancelled when a new switch starts
     private var crossfadeTask: Task<Void, Error>?
-    private var didLogEQBypassForMultichannel = false
 
     // MARK: - Public Properties
 
@@ -516,13 +515,25 @@ final class ProcessTapController: ProcessTapControlling {
         return nil
     }
 
-    private func maybeLogEQBypass(for tapID: AudioObjectID) {
-        guard !didLogEQBypassForMultichannel else { return }
-        guard let asbd = try? tapID.readAudioTapStreamBasicDescription() else { return }
-        guard asbd.mChannelsPerFrame != 2 else { return }
-
-        didLogEQBypassForMultichannel = true
-        logger.info("EQ processing is stereo-only and will be bypassed for tap format with \(asbd.mChannelsPerFrame) channels.")
+    /// Logs, once per aggregate, which stereo-pair layout the IO callback will run the EQ chain on.
+    /// Mirrors `locateStereoPair` for the first output buffer (the one fed from the tap).
+    private func logEQLayout(aggregateID: AudioObjectID, tapID: AudioObjectID, preferred: (left: Int, right: Int)) {
+        let outputChannels = aggregateID.outputBufferChannelCounts()
+        let tapChannels = (try? tapID.readAudioTapStreamBasicDescription().mChannelsPerFrame) ?? 0
+        let first = outputChannels.first.map { max(1, $0) } ?? 0
+        let layout: String
+        if first == 2 {
+            layout = "A (2-channel interleaved, in place)"
+        } else if first > 2 {
+            let left = min(max(preferred.left, 0), first - 1)
+            let right = min(max(preferred.right, 0), first - 1)
+            layout = "B (\(first)-channel interleaved, channels \(left + 1)/\(right + 1) via scratch)"
+        } else if first == 1, outputChannels.count > 1, max(1, outputChannels[1]) == 1 {
+            layout = "C (deinterleaved mono pair via scratch)"
+        } else {
+            layout = "D (unsupported, EQ bypassed)"
+        }
+        logger.info("EQ layout \(layout, privacy: .public): output buffers \(outputChannels, privacy: .public), tap \(tapChannels) channels")
     }
 
     /// Creates a process tap, preferring a device-stream tap to preserve multichannel routing.
@@ -541,7 +552,6 @@ final class ProcessTapController: ProcessTapControlling {
                 let err = AudioHardwareCreateProcessTap(streamTap, &tapID)
                 if err == noErr {
                     logger.info("Created stream-specific tap for device \(deviceUID, privacy: .public) (stream \(outputStream))")
-                    maybeLogEQBypass(for: tapID)
                     return (streamTap, tapID)
                 }
 
@@ -572,7 +582,6 @@ final class ProcessTapController: ProcessTapControlling {
         if preferredDeviceUID != nil {
             logger.info("Using stereo mixdown tap fallback")
         }
-        maybeLogEQBypass(for: mixdownTapID)
         return (mixdownTap, mixdownTapID)
     }
 
@@ -621,6 +630,7 @@ final class ProcessTapController: ProcessTapControlling {
         }
 
         logger.debug("Created aggregate device #\(self.primaryResources.aggregateDeviceID)")
+        logEQLayout(aggregateID: primaryResources.aggregateDeviceID, tapID: tapID, preferred: preferred)
 
         // Compute ramp coefficient from actual device sample rate.
         // Formula: coeff = 1 - exp(-1 / (sampleRate * rampTime))
@@ -660,6 +670,8 @@ final class ProcessTapController: ProcessTapControlling {
         nextCallbackID += 1
         _primaryCallbackID = nextCallbackID
         let activateCallbackID = nextCallbackID
+        let activateScratch = StereoScratchBuffer.allocate()
+        primaryResources.stereoScratch = activateScratch
         err = AudioDeviceCreateIOProcIDWithBlock(&primaryResources.deviceProcID, primaryResources.aggregateDeviceID, queue) { @Sendable [weak self] _, inInputData, _, outOutputData, _ in
             guard let self else {
                 // Zero output to prevent garbage audio if controller is deallocated
@@ -669,7 +681,7 @@ final class ProcessTapController: ProcessTapControlling {
                 }
                 return
             }
-            self.processAudioCallback(inInputData, to: outOutputData, callbackID: activateCallbackID)
+            self.processAudioCallback(inInputData, to: outOutputData, callbackID: activateCallbackID, stereoScratch: activateScratch)
         }
         guard err == noErr else {
             cleanupPartialActivation()
@@ -997,6 +1009,7 @@ final class ProcessTapController: ProcessTapControlling {
         }
 
         logger.debug("[CROSSFADE] Created secondary aggregate #\(self.secondaryResources.aggregateDeviceID)")
+        logEQLayout(aggregateID: secondaryResources.aggregateDeviceID, tapID: tapID, preferred: preferred)
 
         let sampleRate: Double
         if let deviceSampleRate = try? secondaryResources.aggregateDeviceID.readNominalSampleRate() {
@@ -1037,6 +1050,8 @@ final class ProcessTapController: ProcessTapControlling {
         nextCallbackID += 1
         _secondaryCallbackID = nextCallbackID
         let secondaryCallbackID = nextCallbackID
+        let secondaryScratch = StereoScratchBuffer.allocate()
+        secondaryResources.stereoScratch = secondaryScratch
         err = AudioDeviceCreateIOProcIDWithBlock(&secondaryResources.deviceProcID, secondaryResources.aggregateDeviceID, queue) { @Sendable [weak self] _, inInputData, _, outOutputData, _ in
             guard let self else {
                 // Zero output to prevent garbage audio if controller is deallocated
@@ -1046,7 +1061,7 @@ final class ProcessTapController: ProcessTapControlling {
                 }
                 return
             }
-            self.processAudioCallback(inInputData, to: outOutputData, callbackID: secondaryCallbackID)
+            self.processAudioCallback(inInputData, to: outOutputData, callbackID: secondaryCallbackID, stereoScratch: secondaryScratch)
         }
         guard err == noErr else {
             secondaryResources.destroy()
@@ -1208,10 +1223,13 @@ final class ProcessTapController: ProcessTapControlling {
             newResources.destroy()
             throw CrossfadeError.deviceNotReady
         }
+        logEQLayout(aggregateID: newResources.aggregateDeviceID, tapID: tapID, preferred: preferred)
 
         nextCallbackID += 1
         _primaryCallbackID = nextCallbackID
         let switchCallbackID = nextCallbackID
+        let switchScratch = StereoScratchBuffer.allocate()
+        newResources.stereoScratch = switchScratch
         err = AudioDeviceCreateIOProcIDWithBlock(&newResources.deviceProcID, newResources.aggregateDeviceID, queue) { @Sendable [weak self] _, inInputData, _, outOutputData, _ in
             guard let self else {
                 // Zero output to prevent garbage audio if controller is deallocated
@@ -1221,7 +1239,7 @@ final class ProcessTapController: ProcessTapControlling {
                 }
                 return
             }
-            self.processAudioCallback(inInputData, to: outOutputData, callbackID: switchCallbackID)
+            self.processAudioCallback(inInputData, to: outOutputData, callbackID: switchCallbackID, stereoScratch: switchScratch)
         }
         guard err == noErr else {
             newResources.destroy()
@@ -1328,11 +1346,19 @@ final class ProcessTapController: ProcessTapControlling {
         eqProc: EQProcessor?,
         autoEQProc: AutoEQProcessor?,
         loudnessEqualizerProc: LoudnessEqualizer?,
-        loudnessCompensatorProc: LoudnessCompensator?
+        loudnessCompensatorProc: LoudnessCompensator?,
+        stereoScratch: UnsafeMutablePointer<Float>? = nil,
+        scratchFrames: Int = 0
     ) {
         let inputBufferCount = inputBuffers.count
         let outputBufferCount = outputBuffers.count
 
+        // The EQ chain runs once per callback, on the first output buffer fed from the tap.
+        var eqBufferIndex = -1
+        var eqFrameCount = 0
+        var nextBufferFrameCount = 0  // Frames mapped into eqBufferIndex + 1 (right channel of a split-mono pair)
+
+        // Pass 1: channel mapping + volume ramp
         for outputIndex in 0..<outputBufferCount {
             let outputBuffer = outputBuffers[outputIndex]
             guard let outputData = outputBuffer.mData else { continue }
@@ -1372,9 +1398,6 @@ final class ProcessTapController: ProcessTapControlling {
 
             let safeLeft = min(max(preferredStereoLeft, 0), max(outputChannels - 1, 0))
             let safeRight = min(max(preferredStereoRight, 0), max(outputChannels - 1, 0))
-
-            let eq = eqProc  // Parameter read — each callback passes its own processor
-            let eqCanProcessStereoInterleaved = (inputChannels == 2 && outputChannels == 2)
 
             if inputChannels == outputChannels {
                 let sampleCount = frameCount * inputChannels
@@ -1447,27 +1470,189 @@ final class ProcessTapController: ProcessTapControlling {
                 }
             }
 
-            if let eq = eq, eq.isEnabled, eqCanProcessStereoInterleaved {
-                eq.process(input: outputSamples, output: outputSamples, frameCount: frameCount)
+            if eqBufferIndex < 0 {
+                eqBufferIndex = outputIndex
+                eqFrameCount = frameCount
+            } else if outputIndex == eqBufferIndex + 1 {
+                nextBufferFrameCount = frameCount
             }
+        }
 
-            // Per-device AutoEQ correction (after per-app EQ)
-            if let autoEQProc, autoEQProc.isEnabled, eqCanProcessStereoInterleaved {
-                autoEQProc.process(input: outputSamples, output: outputSamples, frameCount: frameCount)
+        // Pass 2: EQ chain, once per callback, on the stereo pair carrying the app's audio
+        if eqBufferIndex >= 0,
+           let pair = locateStereoPair(
+               outputBuffers,
+               bufferIndex: eqBufferIndex,
+               frameCount: eqFrameCount,
+               nextBufferFrameCount: nextBufferFrameCount,
+               preferredLeft: preferredStereoLeft,
+               preferredRight: preferredStereoRight
+           ) {
+            runEQChainOnce(
+                pair.location,
+                frameCount: pair.frameCount,
+                scratch: stereoScratch,
+                scratchFrames: scratchFrames,
+                eqProc: eqProc,
+                autoEQProc: autoEQProc,
+                loudnessEqualizerProc: loudnessEqualizerProc,
+                loudnessCompensatorProc: loudnessCompensatorProc
+            )
+        }
+
+        // Pass 3: limiter on every written buffer. Samples past each buffer's mapped
+        // frames were zeroed in pass 1, and the limiter leaves zeros untouched.
+        for outputBuffer in outputBuffers {
+            guard let outputData = outputBuffer.mData else { continue }
+            let sampleCount = Int(outputBuffer.mDataByteSize) / MemoryLayout<Float>.size
+            SoftLimiter.processBuffer(outputData.assumingMemoryBound(to: Float.self), sampleCount: sampleCount)
+        }
+    }
+
+    /// Where the EQ chain finds the app's stereo pair inside the output buffers.
+    nonisolated enum StereoPairLocation {
+        /// 2-channel interleaved buffer: the chain runs in place.
+        case interleavedStereo(UnsafeMutablePointer<Float>)
+        /// Interleaved buffer with more than 2 channels: the pair is gathered into scratch.
+        case interleavedPair(UnsafeMutablePointer<Float>, channels: Int, left: Int, right: Int)
+        /// Deinterleaved mono buffers: left and right are gathered into scratch.
+        case splitMono(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>)
+    }
+
+    /// Classifies the output buffer fed from the tap. Returns nil for layouts the EQ chain
+    /// can't handle (a lone mono buffer, or a mono buffer not followed by a mapped mono buffer).
+    @inline(__always)
+    nonisolated static func locateStereoPair(
+        _ outputBuffers: UnsafeMutableAudioBufferListPointer,
+        bufferIndex: Int,
+        frameCount: Int,
+        nextBufferFrameCount: Int,
+        preferredLeft: Int,
+        preferredRight: Int
+    ) -> (location: StereoPairLocation, frameCount: Int)? {
+        let buffer = outputBuffers[bufferIndex]
+        guard let data = buffer.mData else { return nil }
+        let samples = data.assumingMemoryBound(to: Float.self)
+        let channels = max(1, Int(buffer.mNumberChannels))
+
+        if channels == 2 {
+            return (.interleavedStereo(samples), frameCount)
+        }
+        if channels > 2 {
+            // Same clamping as the channel mapping in pass 1
+            let left = min(max(preferredLeft, 0), channels - 1)
+            let right = min(max(preferredRight, 0), channels - 1)
+            return (.interleavedPair(samples, channels: channels, left: left, right: right), frameCount)
+        }
+
+        let rightIndex = bufferIndex + 1
+        guard rightIndex < outputBuffers.count, nextBufferFrameCount > 0 else { return nil }
+        let rightBuffer = outputBuffers[rightIndex]
+        guard max(1, Int(rightBuffer.mNumberChannels)) == 1, let rightData = rightBuffer.mData else { return nil }
+        return (
+            .splitMono(left: samples, right: rightData.assumingMemoryBound(to: Float.self)),
+            min(frameCount, nextBufferFrameCount)
+        )
+    }
+
+    /// Runs the EQ chain on the located pair: in place for 2-channel buffers, otherwise
+    /// gather → process → scatter through `scratch` in chunks of `scratchFrames`.
+    /// Channels outside the pair are never touched. Without scratch, gathered layouts bypass.
+    @inline(__always)
+    nonisolated static func runEQChainOnce(
+        _ location: StereoPairLocation,
+        frameCount: Int,
+        scratch: UnsafeMutablePointer<Float>?,
+        scratchFrames: Int,
+        eqProc: EQProcessor?,
+        autoEQProc: AutoEQProcessor?,
+        loudnessEqualizerProc: LoudnessEqualizer?,
+        loudnessCompensatorProc: LoudnessCompensator?
+    ) {
+        if case .interleavedStereo(let samples) = location {
+            runEQChain(
+                samples, frameCount: frameCount,
+                eqProc: eqProc, autoEQProc: autoEQProc,
+                loudnessEqualizerProc: loudnessEqualizerProc, loudnessCompensatorProc: loudnessCompensatorProc
+            )
+            return
+        }
+
+        // Gather/scatter costs two passes over the pair; skip it when nothing would process.
+        let anyEnabled = (eqProc?.isEnabled ?? false)
+            || (autoEQProc?.isEnabled ?? false)
+            || (loudnessEqualizerProc?.isEnabled ?? false)
+            || (loudnessCompensatorProc?.isEnabled ?? false)
+        guard anyEnabled, let scratch, scratchFrames > 0 else { return }
+
+        var start = 0
+        while start < frameCount {
+            let chunk = min(scratchFrames, frameCount - start)
+            switch location {
+            case .interleavedPair(let samples, let channels, let left, let right):
+                for i in 0..<chunk {
+                    let base = (start + i) * channels
+                    scratch[2 * i] = samples[base + left]
+                    scratch[2 * i + 1] = samples[base + right]
+                }
+                runEQChain(
+                    scratch, frameCount: chunk,
+                    eqProc: eqProc, autoEQProc: autoEQProc,
+                    loudnessEqualizerProc: loudnessEqualizerProc, loudnessCompensatorProc: loudnessCompensatorProc
+                )
+                for i in 0..<chunk {
+                    let base = (start + i) * channels
+                    samples[base + left] = scratch[2 * i]
+                    samples[base + right] = scratch[2 * i + 1]
+                }
+            case .splitMono(let left, let right):
+                for i in 0..<chunk {
+                    scratch[2 * i] = left[start + i]
+                    scratch[2 * i + 1] = right[start + i]
+                }
+                runEQChain(
+                    scratch, frameCount: chunk,
+                    eqProc: eqProc, autoEQProc: autoEQProc,
+                    loudnessEqualizerProc: loudnessEqualizerProc, loudnessCompensatorProc: loudnessCompensatorProc
+                )
+                for i in 0..<chunk {
+                    left[start + i] = scratch[2 * i]
+                    right[start + i] = scratch[2 * i + 1]
+                }
+            case .interleavedStereo:
+                return
             }
+            start += chunk
+        }
+    }
 
-            // Loudness Equalization (before loudness compensation)
-            if let loudnessEqualizerProc, loudnessEqualizerProc.isEnabled, eqCanProcessStereoInterleaved {
-                loudnessEqualizerProc.process(input: UnsafePointer(outputSamples), output: outputSamples, frameCount: frameCount, channelCount: outputChannels)
-            }
+    /// The EQ chain stages, in order, on stereo interleaved samples.
+    @inline(__always)
+    nonisolated static func runEQChain(
+        _ samples: UnsafeMutablePointer<Float>,
+        frameCount: Int,
+        eqProc: EQProcessor?,
+        autoEQProc: AutoEQProcessor?,
+        loudnessEqualizerProc: LoudnessEqualizer?,
+        loudnessCompensatorProc: LoudnessCompensator?
+    ) {
+        if let eqProc, eqProc.isEnabled {
+            eqProc.process(input: samples, output: samples, frameCount: frameCount)
+        }
 
-            // Loudness compensation (after all EQ, before limiting)
-            if let loudnessCompensatorProc, loudnessCompensatorProc.isEnabled, eqCanProcessStereoInterleaved {
-                loudnessCompensatorProc.process(input: outputSamples, output: outputSamples, frameCount: frameCount)
-            }
+        // Per-device AutoEQ correction (after per-app EQ)
+        if let autoEQProc, autoEQProc.isEnabled {
+            autoEQProc.process(input: samples, output: samples, frameCount: frameCount)
+        }
 
-            let writtenSampleCount = frameCount * outputChannels
-            SoftLimiter.processBuffer(outputSamples, sampleCount: writtenSampleCount)
+        // Loudness Equalization (before loudness compensation)
+        if let loudnessEqualizerProc, loudnessEqualizerProc.isEnabled {
+            loudnessEqualizerProc.process(input: UnsafePointer(samples), output: samples, frameCount: frameCount, channelCount: 2)
+        }
+
+        // Loudness compensation (after all EQ, before limiting)
+        if let loudnessCompensatorProc, loudnessCompensatorProc.isEnabled {
+            loudnessCompensatorProc.process(input: samples, output: samples, frameCount: frameCount)
         }
     }
 
@@ -1491,7 +1676,8 @@ final class ProcessTapController: ProcessTapControlling {
     nonisolated private func processAudioCallback(
         _ inputBufferList: UnsafePointer<AudioBufferList>,
         to outputBufferList: UnsafeMutablePointer<AudioBufferList>,
-        callbackID: UInt32
+        callbackID: UInt32,
+        stereoScratch: StereoScratchBuffer
     ) {
         _lastRenderHostTime = mach_absolute_time()
         _hasRenderedAudio = true
@@ -1630,7 +1816,9 @@ final class ProcessTapController: ProcessTapControlling {
             eqProc: eqProc,
             autoEQProc: autoEQProc,
             loudnessEqualizerProc: loudnessEqualizerProc,
-            loudnessCompensatorProc: loudnessCompensatorProc
+            loudnessCompensatorProc: loudnessCompensatorProc,
+            stereoScratch: stereoScratch.samples,
+            scratchFrames: StereoScratchBuffer.frameCapacity
         )
 
         if isPrimary {
