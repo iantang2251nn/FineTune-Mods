@@ -44,6 +44,21 @@ struct DeviceRow: View {
     let isFocused: Bool
     let iconOverrideSymbol: String?
 
+    // Device parametric EQ (all optional — existing call sites work without them)
+    let deviceEQ: ParametricEQSettings?
+    let parametricPresets: [UserParametricPreset]
+    let deviceSampleRate: Double?
+    let isEQExpanded: Bool
+    let selectedEQBand: Binding<Int>?
+    let onEQToggle: (() -> Void)?
+    let onDeviceEQChange: ((ParametricEQSettings) -> Void)?
+    let onSavePreset: ((String, ParametricEQSettings) -> Void)?
+    let onDeleteParametricPreset: ((UUID) -> Void)?
+    let onRenameParametricPreset: ((UUID, String) -> Void)?
+
+    @State private var localDeviceEQ: ParametricEQSettings
+    @State private var fallbackSelectedBand = 0
+
     @State private var sliderValue: Double
     @State private var isEditing = false
     @State private var suppressSliderAutoUnmute = false
@@ -94,7 +109,17 @@ struct DeviceRow: View {
         autoEQPreampEnabled: Bool = true,
         onAutoEQPreampToggle: (() -> Void)? = nil,
         isFocused: Bool = false,
-        iconOverrideSymbol: String? = nil
+        iconOverrideSymbol: String? = nil,
+        deviceEQ: ParametricEQSettings? = nil,
+        parametricPresets: [UserParametricPreset] = [],
+        deviceSampleRate: Double? = nil,
+        isEQExpanded: Bool = false,
+        selectedEQBand: Binding<Int>? = nil,
+        onEQToggle: (() -> Void)? = nil,
+        onDeviceEQChange: ((ParametricEQSettings) -> Void)? = nil,
+        onSavePreset: ((String, ParametricEQSettings) -> Void)? = nil,
+        onDeleteParametricPreset: ((UUID) -> Void)? = nil,
+        onRenameParametricPreset: ((UUID, String) -> Void)? = nil
     ) {
         self.device = device
         self.isDefault = isDefault
@@ -118,23 +143,58 @@ struct DeviceRow: View {
         self.onAutoEQPreampToggle = onAutoEQPreampToggle
         self.isFocused = isFocused
         self.iconOverrideSymbol = iconOverrideSymbol
+        self.deviceEQ = deviceEQ
+        self.parametricPresets = parametricPresets
+        self.deviceSampleRate = deviceSampleRate
+        self.isEQExpanded = isEQExpanded
+        self.selectedEQBand = selectedEQBand
+        self.onEQToggle = onEQToggle
+        self.onDeviceEQChange = onDeviceEQChange
+        self.onSavePreset = onSavePreset
+        self.onDeleteParametricPreset = onDeleteParametricPreset
+        self.onRenameParametricPreset = onRenameParametricPreset
+        self._localDeviceEQ = State(initialValue: deviceEQ ?? .flat)
         self._sliderValue = State(initialValue: Self.volumeToSlider(volume, backend: volumeBackend))
     }
 
+    /// The device curve is doing something (on and not flat) — tints the EQ button.
+    private var isDeviceEQActive: Bool {
+        guard let deviceEQ else { return false }
+        return deviceEQ.isEnabled && !deviceEQ.isEffectivelyFlat
+    }
+
     var body: some View {
-        deviceHeader
-            .contentShape(Rectangle())
-            .onTapGesture {
-                // Whole-row tap sets this device as default. Inner controls
-                // (volume slider, mute button, AutoEQ picker, percent field)
-                // are Button/Slider/TextField subviews that capture their
-                // own gestures, so they do not propagate to this handler.
-                // Mirrors the macOS Sound submenu pattern.
-                if !isDefault {
-                    onSetDefault()
+        ExpandableGlassRow(isExpanded: isEQExpanded, isFocused: isFocused) {
+            deviceHeader
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    // Header tap sets this device as default (not the whole row, so clicks
+                    // inside an open EQ panel don't change the default device). Inner controls
+                    // (volume slider, mute button, AutoEQ picker, EQ button, percent field)
+                    // are Button/Slider/TextField subviews that capture their own gestures,
+                    // so they do not propagate to this handler.
+                    // Mirrors the macOS Sound submenu pattern.
+                    if !isDefault {
+                        onSetDefault()
+                    }
                 }
-            }
-            .hoverableRow(isFocused: isFocused)
+        } expandedContent: {
+            ParametricEQPanelView(
+                settings: $localDeviceEQ,
+                selectedBand: selectedEQBand ?? $fallbackSelectedBand,
+                presets: parametricPresets,
+                sampleRate: deviceSampleRate ?? 48000,
+                onSettingsChanged: { settings in onDeviceEQChange?(settings) },
+                onSavePreset: { name, settings in onSavePreset?(name, settings) },
+                onDeletePreset: { id in onDeleteParametricPreset?(id) },
+                onRenamePreset: { id, name in onRenameParametricPreset?(id, name) }
+            )
+            .padding(.top, DesignTokens.Spacing.sm)
+        }
+        .onChange(of: deviceEQ) { _, newValue in
+            // Sync from parent when the stored curve changes
+            localDeviceEQ = newValue ?? .flat
+        }
     }
 
     // MARK: - Device Header
@@ -184,6 +244,11 @@ struct DeviceRow: View {
                         preampEnabled: autoEQPreampEnabled,
                         onPreampToggle: onAutoEQPreampToggle
                     )
+                }
+
+                // Device EQ button, also in the name area so slider length stays consistent
+                if let onEQToggle {
+                    EQToggleButton(isExpanded: isEQExpanded, isActive: isDeviceEQActive, onToggle: onEQToggle)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

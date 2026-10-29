@@ -211,6 +211,29 @@ enum BiquadMath {
         return allCoeffs
     }
 
+    /// Magnitude response in dB at `frequency` of a cascade of vDSP-format sections
+    /// ([b0, b1, b2, a1, a2] per section, as returned by the functions above).
+    static func cascadeMagnitudeDB(
+        _ coefficients: [Double],
+        frequency: Double,
+        sampleRate: Double
+    ) -> Double {
+        let omega = 2.0 * .pi * frequency / sampleRate
+        // e^{-jω} and e^{-2jω}
+        let c1 = cos(omega), s1 = -sin(omega)
+        let c2 = cos(2.0 * omega), s2 = -sin(2.0 * omega)
+
+        var totalDB = 0.0
+        for section in stride(from: 0, to: coefficients.count - 4, by: 5) {
+            let b0 = coefficients[section], b1 = coefficients[section + 1], b2 = coefficients[section + 2]
+            let a1 = coefficients[section + 3], a2 = coefficients[section + 4]
+            let numRe = b0 + b1 * c1 + b2 * c2, numIm = b1 * s1 + b2 * s2
+            let denRe = 1.0 + a1 * c1 + a2 * c2, denIm = a1 * s1 + a2 * s2
+            totalDB += 10.0 * log10((numRe * numRe + numIm * numIm) / (denRe * denRe + denIm * denIm))
+        }
+        return totalDB
+    }
+
     /// Compute coefficients for all 10 bands
     /// Returns 50 Doubles: [band0: b0,b1,b2,a1,a2, band1: ..., ...]
     static func coefficientsForAllBands(

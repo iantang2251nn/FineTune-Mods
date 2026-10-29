@@ -39,12 +39,18 @@ struct MenuBarPopupView: View {
     /// Which device tab is selected (false = output, true = input)
     @State private var showingInputDevices = false
 
-    /// Track which app has its EQ panel expanded (only one at a time)
-    /// Uses DisplayableApp.id (String) to work with both active and inactive apps
+    /// Track which row has its EQ panel expanded (only one at a time)
+    /// Uses DisplayableApp.id (String) for app rows and "device:<uid>" for output device rows
     @State private var expandedRowID: String?
 
     /// Debounce EQ toggle to prevent rapid clicks during animation
     @State private var isEQAnimating = false
+
+    /// Last selected parametric band per output device UID, kept for the session.
+    @State private var deviceEQSelectedBands: [String: Int] = [:]
+    /// Bumped on device EQ and parametric preset changes so rows re-read SettingsManager
+    /// (which isn't observable).
+    @State private var deviceEQRevision = 0
 
     /// Track popup visibility to pause VU meter polling when hidden
     @State private var isPopupVisible = true
@@ -334,7 +340,7 @@ struct MenuBarPopupView: View {
     private func mainContent(scrollProxy: ScrollViewProxy) -> some View {
         VStack(alignment: .leading, spacing: DesignTokens.Spacing.sm) {
             // Devices section (tabbed: Output / Input)
-            devicesSection
+            devicesSection(scrollProxy: scrollProxy)
 
             Divider()
                 .padding(.vertical, DesignTokens.Spacing.xs)
@@ -500,11 +506,11 @@ struct MenuBarPopupView: View {
     // MARK: - Subviews
 
     @ViewBuilder
-    private var devicesSection: some View {
-        devicesContent
+    private func devicesSection(scrollProxy: ScrollViewProxy) -> some View {
+        devicesContent(scrollProxy: scrollProxy)
     }
 
-    private var devicesContent: some View {
+    private func devicesContent(scrollProxy: ScrollViewProxy) -> some View {
         VStack(spacing: 0) {
             if isEditingDevicePriority {
                 // Edit mode: drag-and-drop reordering (works for both output and input)
@@ -569,63 +575,101 @@ struct MenuBarPopupView: View {
                 }
             } else {
                 ForEach(sortedDevices) { device in
-                    let selection = audioEngine.getAutoEQSelection(for: device.uid)
-                    let profileName: String? = {
-                        guard let sel = selection else { return nil }
-                        return audioEngine.autoEQProfileManager.profile(for: sel.profileID)?.name
-                            ?? audioEngine.autoEQProfileManager.catalogEntry(for: sel.profileID)?.name
-                    }()
-
-                    DeviceRow(
-                        device: device,
-                        isDefault: device.id == deviceVolumeMonitor.defaultDeviceID,
-                        volume: deviceVolumeMonitor.volumes[device.id] ?? 1.0,
-                        isMuted: deviceVolumeMonitor.muteStates[device.id] ?? false,
-                        volumeBackend: audioEngine.outputVolumeBackend(for: device.id),
-                        onSetDefault: {
-                            audioEngine.setDefaultOutputDevice(device.id)
-                        },
-                        onVolumeChange: { volume in
-                            deviceVolumeMonitor.setVolume(for: device.id, to: volume)
-                        },
-                        onMuteToggle: {
-                            let currentMute = deviceVolumeMonitor.muteStates[device.id] ?? false
-                            deviceVolumeMonitor.setMute(for: device.id, to: !currentMute)
-                        },
-                        autoEQProfileName: profileName,
-                        autoEQEnabled: selection?.isEnabled ?? false,
-                        onAutoEQToggle: { enabled in
-                            audioEngine.setAutoEQEnabled(for: device.uid, enabled: enabled)
-                        },
-                        autoEQProfileManager: audioEngine.autoEQProfileManager,
-                        autoEQSelection: selection,
-                        autoEQFavoriteIDs: audioEngine.settingsManager.favoriteAutoEQProfileIDs,
-                        onAutoEQSelect: { profile in
-                            audioEngine.setAutoEQProfile(for: device.uid, profileID: profile?.id)
-                        },
-                        onAutoEQImport: {
-                            importAutoEQFile(for: device.uid)
-                        },
-                        onAutoEQToggleFavorite: { id in
-                            if audioEngine.settingsManager.isAutoEQFavorite(id: id) {
-                                audioEngine.settingsManager.unfavoriteAutoEQProfile(id: id)
-                            } else {
-                                audioEngine.settingsManager.favoriteAutoEQProfile(id: id)
-                            }
-                        },
-                        autoEQImportError: autoEQImportError,
-                        autoEQPreampEnabled: audioEngine.autoEQPreampEnabled,
-                        onAutoEQPreampToggle: {
-                            audioEngine.setAutoEQPreampEnabled(!audioEngine.autoEQPreampEnabled)
-                        },
-                        isFocused: hasKeyboardEngaged && selectedRow == .device(uid: device.uid),
-                        iconOverrideSymbol: audioEngine.settingsManager.getDeviceIconOverride(for: device.uid)
-                    )
-                    .id(PopupKeyboardNavModel.RowID.device(uid: device.uid))
+                    outputDeviceRow(device, scrollProxy: scrollProxy)
+                        .id(PopupKeyboardNavModel.RowID.device(uid: device.uid))
                 }
 
             }
         }
+    }
+
+    /// One output device row. Extracted from `devicesContent` to keep the expression within
+    /// Swift's type-check budget.
+    @ViewBuilder
+    private func outputDeviceRow(_ device: AudioDevice, scrollProxy: ScrollViewProxy) -> some View {
+        // Expansion key for the device EQ panel; the prefix can't collide with app IDs.
+        let rowKey = "device:\(device.uid)"
+        let isEQExpanded = expandedRowID == rowKey
+        let _ = deviceEQRevision
+        let selection = audioEngine.getAutoEQSelection(for: device.uid)
+        let profileName: String? = {
+            guard let sel = selection else { return nil }
+            return audioEngine.autoEQProfileManager.profile(for: sel.profileID)?.name
+                ?? audioEngine.autoEQProfileManager.catalogEntry(for: sel.profileID)?.name
+        }()
+
+        DeviceRow(
+            device: device,
+            isDefault: device.id == deviceVolumeMonitor.defaultDeviceID,
+            volume: deviceVolumeMonitor.volumes[device.id] ?? 1.0,
+            isMuted: deviceVolumeMonitor.muteStates[device.id] ?? false,
+            volumeBackend: audioEngine.outputVolumeBackend(for: device.id),
+            onSetDefault: {
+                audioEngine.setDefaultOutputDevice(device.id)
+            },
+            onVolumeChange: { volume in
+                deviceVolumeMonitor.setVolume(for: device.id, to: volume)
+            },
+            onMuteToggle: {
+                let currentMute = deviceVolumeMonitor.muteStates[device.id] ?? false
+                deviceVolumeMonitor.setMute(for: device.id, to: !currentMute)
+            },
+            autoEQProfileName: profileName,
+            autoEQEnabled: selection?.isEnabled ?? false,
+            onAutoEQToggle: { enabled in
+                audioEngine.setAutoEQEnabled(for: device.uid, enabled: enabled)
+            },
+            autoEQProfileManager: audioEngine.autoEQProfileManager,
+            autoEQSelection: selection,
+            autoEQFavoriteIDs: audioEngine.settingsManager.favoriteAutoEQProfileIDs,
+            onAutoEQSelect: { profile in
+                audioEngine.setAutoEQProfile(for: device.uid, profileID: profile?.id)
+            },
+            onAutoEQImport: {
+                importAutoEQFile(for: device.uid)
+            },
+            onAutoEQToggleFavorite: { id in
+                if audioEngine.settingsManager.isAutoEQFavorite(id: id) {
+                    audioEngine.settingsManager.unfavoriteAutoEQProfile(id: id)
+                } else {
+                    audioEngine.settingsManager.favoriteAutoEQProfile(id: id)
+                }
+            },
+            autoEQImportError: autoEQImportError,
+            autoEQPreampEnabled: audioEngine.autoEQPreampEnabled,
+            onAutoEQPreampToggle: {
+                audioEngine.setAutoEQPreampEnabled(!audioEngine.autoEQPreampEnabled)
+            },
+            isFocused: hasKeyboardEngaged && selectedRow == .device(uid: device.uid),
+            iconOverrideSymbol: audioEngine.settingsManager.getDeviceIconOverride(for: device.uid),
+            deviceEQ: audioEngine.getDeviceEQ(for: device.uid),
+            parametricPresets: audioEngine.settingsManager.getParametricPresets(),
+            deviceSampleRate: isEQExpanded ? (try? device.id.readNominalSampleRate()) : nil,
+            isEQExpanded: isEQExpanded,
+            selectedEQBand: Binding(
+                get: { deviceEQSelectedBands[device.uid] ?? 0 },
+                set: { deviceEQSelectedBands[device.uid] = $0 }
+            ),
+            onEQToggle: {
+                toggleEQ(for: rowKey, scrollTarget: .device(uid: device.uid), scrollProxy: scrollProxy)
+            },
+            onDeviceEQChange: { settings in
+                audioEngine.setDeviceEQ(settings, for: device.uid)
+                deviceEQRevision += 1
+            },
+            onSavePreset: { name, settings in
+                audioEngine.settingsManager.createParametricPreset(name: name, settings: settings)
+                deviceEQRevision += 1
+            },
+            onDeleteParametricPreset: { id in
+                audioEngine.settingsManager.deleteParametricPreset(id: id)
+                deviceEQRevision += 1
+            },
+            onRenameParametricPreset: { id, newName in
+                audioEngine.settingsManager.renameParametricPreset(id: id, name: newName)
+                deviceEQRevision += 1
+            }
+        )
     }
 
     /// Builds a single row for the priority-edit list. Extracted from
@@ -921,7 +965,7 @@ struct MenuBarPopupView: View {
                 },
                 isEQExpanded: expandedRowID == displayableApp.id,
                 onEQToggle: {
-                    toggleEQ(for: displayableApp.id, scrollProxy: scrollProxy)
+                    toggleEQ(for: displayableApp.id, scrollTarget: .app(persistenceID: displayableApp.id), scrollProxy: scrollProxy)
                 },
                 isFocused: hasKeyboardEngaged && selectedRow == .app(persistenceID: displayableApp.id)
             )
@@ -989,27 +1033,27 @@ struct MenuBarPopupView: View {
             },
             isEQExpanded: expandedRowID == displayableApp.id,
             onEQToggle: {
-                toggleEQ(for: displayableApp.id, scrollProxy: scrollProxy)
+                toggleEQ(for: displayableApp.id, scrollTarget: .app(persistenceID: displayableApp.id), scrollProxy: scrollProxy)
             },
             isFocused: hasKeyboardEngaged && selectedRow == .app(persistenceID: displayableApp.id)
         )
         .id(PopupKeyboardNavModel.RowID.app(persistenceID: displayableApp.id))
     }
 
-    /// Toggle EQ panel for an app (shared between active and inactive rows)
-    private func toggleEQ(for appID: String, scrollProxy: ScrollViewProxy) {
+    /// Toggle the EQ panel for a row (app rows and output device rows). Only one panel is open at a time.
+    private func toggleEQ(for rowKey: String, scrollTarget: PopupKeyboardNavModel.RowID, scrollProxy: ScrollViewProxy) {
         guard !isEQAnimating else { return }
         isEQAnimating = true
 
-        let isExpanding = expandedRowID != appID
+        let isExpanding = expandedRowID != rowKey
         withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-            if expandedRowID == appID {
+            if expandedRowID == rowKey {
                 expandedRowID = nil
             } else {
-                expandedRowID = appID
+                expandedRowID = rowKey
             }
             if isExpanding {
-                scrollProxy.scrollTo(PopupKeyboardNavModel.RowID.app(persistenceID: appID), anchor: .top)
+                scrollProxy.scrollTo(scrollTarget, anchor: .top)
             }
         }
 
