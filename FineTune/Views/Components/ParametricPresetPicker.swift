@@ -1,10 +1,12 @@
 // FineTune/Views/Components/ParametricPresetPicker.swift
 import SwiftUI
 
-/// Sections for the parametric preset picker: "Flat" first, then the user's presets.
+/// Sections for the parametric preset picker: "Flat" first, then the user's presets,
+/// then file import/export.
 enum ParametricPickerSection: String, Identifiable, Hashable {
     case defaults = "Default"
     case myPresets = "My Presets"
+    case file = "File"
 
     var id: String { rawValue }
 }
@@ -16,6 +18,8 @@ struct ParametricPickerItem: Identifiable, Hashable {
     let presetID: UUID?
 
     static let flat = ParametricPickerItem(id: "flat", name: "Flat", presetID: nil)
+    static let importFile = ParametricPickerItem(id: "import", name: "Import…", presetID: nil)
+    static let exportFile = ParametricPickerItem(id: "export", name: "Export…", presetID: nil)
 
     init(preset: UserParametricPreset) {
         self.id = "parametric-\(preset.id.uuidString)"
@@ -43,15 +47,22 @@ struct ParametricPresetPicker: View {
     let onFlatSelected: () -> Void
     let onPresetSelected: (UserParametricPreset) -> Void
     let onDeletePreset: (UUID) -> Void
+    var onImport: (() -> Void)? = nil
+    var onExport: (() -> Void)? = nil
 
     private var sections: [ParametricPickerSection] {
-        presets.isEmpty ? [.defaults] : [.defaults, .myPresets]
+        var result: [ParametricPickerSection] = [.defaults]
+        if !presets.isEmpty { result.append(.myPresets) }
+        if onImport != nil || onExport != nil { result.append(.file) }
+        return result
     }
 
     private func items(for section: ParametricPickerSection) -> [ParametricPickerItem] {
         switch section {
         case .defaults: return [.flat]
         case .myPresets: return presets.map { ParametricPickerItem(preset: $0) }
+        case .file:
+            return (onImport != nil ? [.importFile] : []) + (onExport != nil ? [.exportFile] : [])
         }
     }
 
@@ -60,6 +71,10 @@ struct ParametricPresetPicker: View {
             onPresetSelected(preset)
         } else if item == .flat {
             onFlatSelected()
+        } else if item == .importFile {
+            onImport?()
+        } else if item == .exportFile {
+            onExport?()
         }
     }
 

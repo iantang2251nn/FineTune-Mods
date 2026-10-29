@@ -13,6 +13,10 @@ struct ParametricEQPanelView: View {
     let onSavePreset: (String, ParametricEQSettings) -> Void
     let onDeletePreset: (UUID) -> Void
     let onRenamePreset: (UUID, String) -> Void
+    var onImport: (() -> Void)? = nil
+    var onExport: (() -> Void)? = nil
+    /// Result of the last import/export, shown under the header.
+    var statusMessage: String? = nil
 
     @State private var isSaving = false
     @State private var savePresetName = ""
@@ -57,12 +61,28 @@ struct ParametricEQPanelView: View {
             header
                 .zIndex(1)  // Ensure dropdown renders above the curve
 
+            if let statusMessage {
+                Text(statusMessage)
+                    .font(DesignTokens.Typography.caption)
+                    .foregroundStyle(DesignTokens.Colors.textTertiary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(.opacity)
+            }
+
             VStack(spacing: 8) {
                 ParametricEQCurveView(
                     settings: settings,
                     sampleRate: sampleRate,
                     selectedBand: bandIndex,
-                    onSelectBand: { selectedBand = $0 }
+                    onSelectBand: { selectedBand = $0 },
+                    onBandChange: { index, frequency, gainDB in
+                        update { s in
+                            s.bands[index].frequency = frequency
+                            s.bands[index].gainDB = gainDB
+                        }
+                    },
+                    onResetGain: { index in update { $0.bands[index].gainDB = 0 } },
+                    onQChange: { index, q in update { $0.bands[index].q = q } }
                 )
                 .frame(height: 80)
 
@@ -142,7 +162,9 @@ struct ParametricEQPanelView: View {
                             s.outputGainDB = preset.settings.outputGainDB
                         }
                     },
-                    onDeletePreset: onDeletePreset
+                    onDeletePreset: onDeletePreset,
+                    onImport: onImport,
+                    onExport: onExport
                 )
             }
         }
@@ -465,11 +487,16 @@ struct ParametricEQPanelView: View {
 // MARK: - Response Curve
 
 /// Log-frequency response of the device curve (20 Hz–20 kHz, −24 to +12 dB) with one node per band.
+/// Drag a node to move its frequency (horizontal) and gain (vertical), scroll over it for Q,
+/// double-click it to reset its gain.
 struct ParametricEQCurveView: View {
     let settings: ParametricEQSettings
     let sampleRate: Double
     let selectedBand: Int
     let onSelectBand: (Int) -> Void
+    var onBandChange: (Int, Double, Float) -> Void = { _, _, _ in }
+    var onResetGain: (Int) -> Void = { _ in }
+    var onQChange: (Int, Double) -> Void = { _, _ in }
 
     static let minFrequency = 20.0
     static let maxFrequency = 20000.0
@@ -478,6 +505,10 @@ struct ParametricEQCurveView: View {
     static let pointCount = 256
 
     @State private var response: [Double] = []
+    /// Pointer offset from the dragged node's center, so grabbing off-center doesn't jump.
+    @State private var dragOffset: CGSize?
+
+    private static let coordinateSpaceName = "parametricEQCurve"
 
     static func frequency(atFraction x: Double) -> Double {
         minFrequency * pow(maxFrequency / minFrequency, x)
@@ -514,81 +545,79 @@ struct ParametricEQCurveView: View {
 
     var body: some View {
         GeometryReader { geo in
-            Canvas { context, size in
-                let grid = GraphicsContext.Shading.color(DesignTokens.Colors.textTertiary.opacity(0.35))
-                let labelFont = Font.system(size: 8, weight: .medium, design: .monospaced)
+            ZStack(alignment: .topLeading) {
+                Canvas { context, size in
+                    let grid = GraphicsContext.Shading.color(DesignTokens.Colors.textTertiary.opacity(0.35))
+                    let labelFont = Font.system(size: 8, weight: .medium, design: .monospaced)
 
-                // Frequency grid
-                for (f, label) in [(100.0, "100"), (1000.0, "1k"), (10000.0, "10k")] {
-                    let x = Self.fraction(ofFrequency: f) * size.width
-                    var line = Path()
-                    line.move(to: CGPoint(x: x, y: 0))
-                    line.addLine(to: CGPoint(x: x, y: size.height))
-                    context.stroke(line, with: grid, lineWidth: 0.5)
-                    context.draw(
-                        Text(label).font(labelFont).foregroundStyle(DesignTokens.Colors.textTertiary),
-                        at: CGPoint(x: x + 2, y: size.height - 1),
-                        anchor: .bottomLeading
-                    )
-                }
-
-                // 0 dB line and range labels
-                let zeroY = point(fraction: 0, db: 0, in: size).y
-                var zeroLine = Path()
-                zeroLine.move(to: CGPoint(x: 0, y: zeroY))
-                zeroLine.addLine(to: CGPoint(x: size.width, y: zeroY))
-                context.stroke(zeroLine, with: .color(DesignTokens.Colors.unityMarker.opacity(0.6)), lineWidth: 0.75)
-                for (db, label, anchor) in [(Self.maxDB, "+12", UnitPoint.topLeading), (0, "0", .bottomLeading), (Self.minDB, "\u{2212}24", .bottomLeading)] {
-                    context.draw(
-                        Text(label).font(labelFont).foregroundStyle(DesignTokens.Colors.textTertiary),
-                        at: CGPoint(x: 2, y: point(fraction: 0, db: db, in: size).y),
-                        anchor: anchor
-                    )
-                }
-
-                // Response curve
-                if response.count > 1 {
-                    var curve = Path()
-                    for (i, db) in response.enumerated() {
-                        let p = point(fraction: Double(i) / Double(response.count - 1), db: db, in: size)
-                        if i == 0 { curve.move(to: p) } else { curve.addLine(to: p) }
+                    // Frequency grid
+                    for (f, label) in [(100.0, "100"), (1000.0, "1k"), (10000.0, "10k")] {
+                        let x = Self.fraction(ofFrequency: f) * size.width
+                        var line = Path()
+                        line.move(to: CGPoint(x: x, y: 0))
+                        line.addLine(to: CGPoint(x: x, y: size.height))
+                        context.stroke(line, with: grid, lineWidth: 0.5)
+                        context.draw(
+                            Text(label).font(labelFont).foregroundStyle(DesignTokens.Colors.textTertiary),
+                            at: CGPoint(x: x + 2, y: size.height - 1),
+                            anchor: .bottomLeading
+                        )
                     }
-                    context.stroke(curve, with: .color(DesignTokens.Colors.accentPrimary), lineWidth: 1.5)
-                }
 
-                // Band nodes: disabled hollow, selected in the accent color
-                for index in 0..<ParametricEQSettings.bandCount {
-                    let center = nodeCenter(index, in: size)
-                    let node = Path(ellipseIn: CGRect(x: center.x - 4, y: center.y - 4, width: 8, height: 8))
-                    let color = index == selectedBand ? DesignTokens.Colors.accentPrimary : DesignTokens.Colors.textSecondary
-                    if settings.bands[index].isEnabled {
-                        context.fill(node, with: .color(color))
-                    } else {
-                        context.stroke(node, with: .color(color), lineWidth: 1)
+                    // 0 dB line and range labels
+                    let zeroY = point(fraction: 0, db: 0, in: size).y
+                    var zeroLine = Path()
+                    zeroLine.move(to: CGPoint(x: 0, y: zeroY))
+                    zeroLine.addLine(to: CGPoint(x: size.width, y: zeroY))
+                    context.stroke(zeroLine, with: .color(DesignTokens.Colors.unityMarker.opacity(0.6)), lineWidth: 0.75)
+                    for (db, label, anchor) in [(Self.maxDB, "+12", UnitPoint.topLeading), (0, "0", .bottomLeading), (Self.minDB, "\u{2212}24", .bottomLeading)] {
+                        context.draw(
+                            Text(label).font(labelFont).foregroundStyle(DesignTokens.Colors.textTertiary),
+                            at: CGPoint(x: 2, y: point(fraction: 0, db: db, in: size).y),
+                            anchor: anchor
+                        )
+                    }
+
+                    // Response curve
+                    if response.count > 1 {
+                        var curve = Path()
+                        for (i, db) in response.enumerated() {
+                            let p = point(fraction: Double(i) / Double(response.count - 1), db: db, in: size)
+                            if i == 0 { curve.move(to: p) } else { curve.addLine(to: p) }
+                        }
+                        context.stroke(curve, with: .color(DesignTokens.Colors.accentPrimary), lineWidth: 1.5)
+                    }
+
+                    // Band nodes: disabled hollow, selected in the accent color
+                    for index in 0..<ParametricEQSettings.bandCount {
+                        let center = nodeCenter(index, in: size)
+                        let node = Path(ellipseIn: CGRect(x: center.x - 4, y: center.y - 4, width: 8, height: 8))
+                        let color = index == selectedBand ? DesignTokens.Colors.accentPrimary : DesignTokens.Colors.textSecondary
+                        if settings.bands[index].isEnabled {
+                            context.fill(node, with: .color(color))
+                        } else {
+                            context.stroke(node, with: .color(color), lineWidth: 1)
+                        }
+                    }
+
+                    // Peak readout (device curve only, not stacked app EQ)
+                    if let peak = response.max(), peak > 0.05 {
+                        context.draw(
+                            Text("peak \(ParametricValueFormat.gain(peak))")
+                                .font(labelFont)
+                                .foregroundStyle(DesignTokens.Colors.textTertiary),
+                            at: CGPoint(x: size.width - 2, y: 1),
+                            anchor: .topTrailing
+                        )
                     }
                 }
 
-                // Peak readout (device curve only, not stacked app EQ)
-                if let peak = response.max(), peak > 0.05 {
-                    context.draw(
-                        Text("peak \(ParametricValueFormat.gain(peak))")
-                            .font(labelFont)
-                            .foregroundStyle(DesignTokens.Colors.textTertiary),
-                        at: CGPoint(x: size.width - 2, y: 1),
-                        anchor: .topTrailing
-                    )
+                // Only the nodes take pointer input, so scrolling elsewhere still scrolls the popup.
+                ForEach(0..<ParametricEQSettings.bandCount, id: \.self) { index in
+                    nodeHandle(index, size: geo.size)
                 }
             }
-            .contentShape(Rectangle())
-            .onTapGesture(coordinateSpace: .local) { location in
-                // Select the nearest node within reach of the click.
-                let nearest = (0..<ParametricEQSettings.bandCount).min { a, b in
-                    distance(nodeCenter(a, in: geo.size), location) < distance(nodeCenter(b, in: geo.size), location)
-                }
-                if let nearest, distance(nodeCenter(nearest, in: geo.size), location) <= 10 {
-                    onSelectBand(nearest)
-                }
-            }
+            .coordinateSpace(.named(Self.coordinateSpaceName))
         }
         .onAppear { response = Self.response(for: settings, sampleRate: sampleRate) }
         .onChange(of: settings) { _, newValue in response = Self.response(for: newValue, sampleRate: sampleRate) }
@@ -597,7 +626,42 @@ struct ParametricEQCurveView: View {
         .accessibilityLabel("Device EQ response curve")
     }
 
-    private func distance(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
-        hypot(a.x - b.x, a.y - b.y)
+    /// Invisible hit area over one node: press selects, drag moves, scroll changes Q,
+    /// double-click resets the gain.
+    private func nodeHandle(_ index: Int, size: CGSize) -> some View {
+        let center = nodeCenter(index, in: size)
+        let qRange = ParametricEQSettings.qRange(ofBand: index)
+        return Color.clear
+            .frame(width: 20, height: 20)
+            .contentShape(Circle())
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .named(Self.coordinateSpaceName))
+                    .onChanged { value in
+                        if dragOffset == nil {
+                            onSelectBand(index)
+                            dragOffset = CGSize(
+                                width: value.startLocation.x - center.x,
+                                height: value.startLocation.y - center.y
+                            )
+                        }
+                        guard let offset = dragOffset, value.translation != .zero, size.width > 0, size.height > 0 else { return }
+                        let x = min(max(value.location.x - offset.width, 0), size.width)
+                        let y = min(max(value.location.y - offset.height, 0), size.height)
+                        let frequency = Self.frequency(atFraction: x / size.width)
+                        let gainDB = Self.maxDB - y / size.height * (Self.maxDB - Self.minDB)
+                        onBandChange(index, frequency, Float(gainDB))
+                    }
+                    .onEnded { _ in dragOffset = nil }
+            )
+            .simultaneousGesture(TapGesture(count: 2).onEnded { onResetGain(index) })
+            .scrollWheelStep(
+                Binding(
+                    get: { log2(settings.bands[index].q) },
+                    set: { onQChange(index, pow(2, $0)) }
+                ),
+                in: log2(qRange.lowerBound)...log2(qRange.upperBound)
+            )
+            .help("Band \(index + 1): drag to move, scroll to change Q, double-click to reset gain")
+            .position(center)
     }
 }

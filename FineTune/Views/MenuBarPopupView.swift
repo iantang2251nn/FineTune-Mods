@@ -51,6 +51,10 @@ struct MenuBarPopupView: View {
     /// Bumped on device EQ and parametric preset changes so rows re-read SettingsManager
     /// (which isn't observable).
     @State private var deviceEQRevision = 0
+    /// Result of the last device EQ import/export, shown in that device's panel
+    @State private var parametricFileStatus: (deviceUID: String, message: String)?
+    /// Task that auto-clears the import/export status after 4 seconds
+    @State private var parametricStatusClearTask: Task<Void, Never>?
 
     /// Track popup visibility to pause VU meter polling when hidden
     @State private var isPopupVisible = true
@@ -668,7 +672,14 @@ struct MenuBarPopupView: View {
             onRenameParametricPreset: { id, newName in
                 audioEngine.settingsManager.renameParametricPreset(id: id, name: newName)
                 deviceEQRevision += 1
-            }
+            },
+            onImportParametric: {
+                importParametricFile(for: device.uid)
+            },
+            onExportParametric: {
+                exportParametricFile(for: device)
+            },
+            parametricStatus: parametricFileStatus?.deviceUID == device.uid ? parametricFileStatus?.message : nil
         )
     }
 
@@ -1231,6 +1242,67 @@ struct MenuBarPopupView: View {
                     }
                 }
             }
+        }
+    }
+
+    /// Imports an EqualizerAPO / REW filter list onto a device's parametric curve.
+    /// The device keeps its own on/off state; the status line reports what was mapped.
+    private func importParametricFile(for deviceUID: String) {
+        // Dismiss the main popup so the file picker isn't obscured
+        NSApp.keyWindow?.resignKey()
+
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [UTType.plainText]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.message = "Select an EqualizerAPO or REW filter file"
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor in
+                guard let text = try? String(contentsOf: url, encoding: .utf8),
+                      let result = ParametricEQFile.importSettings(from: text) else {
+                    showParametricStatus("Could not import — no usable filters found", for: deviceUID)
+                    return
+                }
+                var updated = audioEngine.getDeviceEQ(for: deviceUID)
+                updated.bands = result.settings.bands
+                updated.outputGainDB = result.settings.outputGainDB
+                audioEngine.setDeviceEQ(updated, for: deviceUID)
+                deviceEQRevision += 1
+                showParametricStatus(result.summary, for: deviceUID)
+            }
+        }
+    }
+
+    /// Exports a device's parametric curve as EqualizerAPO text.
+    private func exportParametricFile(for device: AudioDevice) {
+        NSApp.keyWindow?.resignKey()
+
+        let text = ParametricEQFile.export(audioEngine.getDeviceEQ(for: device.uid))
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType.plainText]
+        panel.nameFieldStringValue = "\(device.name) ParametricEQ.txt"
+        panel.message = "Export the device EQ as EqualizerAPO text"
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor in
+                do {
+                    try text.write(to: url, atomically: true, encoding: .utf8)
+                    showParametricStatus("Exported to \(url.lastPathComponent)", for: device.uid)
+                } catch {
+                    showParametricStatus("Could not export — \(error.localizedDescription)", for: device.uid)
+                }
+            }
+        }
+    }
+
+    private func showParametricStatus(_ message: String, for deviceUID: String) {
+        parametricFileStatus = (deviceUID, message)
+        parametricStatusClearTask?.cancel()
+        parametricStatusClearTask = Task {
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled else { return }
+            withAnimation { parametricFileStatus = nil }
         }
     }
 

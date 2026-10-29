@@ -55,6 +55,9 @@ struct DeviceRow: View {
     let onSavePreset: ((String, ParametricEQSettings) -> Void)?
     let onDeleteParametricPreset: ((UUID) -> Void)?
     let onRenameParametricPreset: ((UUID, String) -> Void)?
+    let onImportParametric: (() -> Void)?
+    let onExportParametric: (() -> Void)?
+    let parametricStatus: String?
 
     @State private var localDeviceEQ: ParametricEQSettings
     @State private var fallbackSelectedBand = 0
@@ -119,7 +122,10 @@ struct DeviceRow: View {
         onDeviceEQChange: ((ParametricEQSettings) -> Void)? = nil,
         onSavePreset: ((String, ParametricEQSettings) -> Void)? = nil,
         onDeleteParametricPreset: ((UUID) -> Void)? = nil,
-        onRenameParametricPreset: ((UUID, String) -> Void)? = nil
+        onRenameParametricPreset: ((UUID, String) -> Void)? = nil,
+        onImportParametric: (() -> Void)? = nil,
+        onExportParametric: (() -> Void)? = nil,
+        parametricStatus: String? = nil
     ) {
         self.device = device
         self.isDefault = isDefault
@@ -153,6 +159,9 @@ struct DeviceRow: View {
         self.onSavePreset = onSavePreset
         self.onDeleteParametricPreset = onDeleteParametricPreset
         self.onRenameParametricPreset = onRenameParametricPreset
+        self.onImportParametric = onImportParametric
+        self.onExportParametric = onExportParametric
+        self.parametricStatus = parametricStatus
         self._localDeviceEQ = State(initialValue: deviceEQ ?? .flat)
         self._sliderValue = State(initialValue: Self.volumeToSlider(volume, backend: volumeBackend))
     }
@@ -187,7 +196,10 @@ struct DeviceRow: View {
                 onSettingsChanged: { settings in onDeviceEQChange?(settings) },
                 onSavePreset: { name, settings in onSavePreset?(name, settings) },
                 onDeletePreset: { id in onDeleteParametricPreset?(id) },
-                onRenamePreset: { id, name in onRenameParametricPreset?(id, name) }
+                onRenamePreset: { id, name in onRenameParametricPreset?(id, name) },
+                onImport: onImportParametric,
+                onExport: onExportParametric,
+                statusMessage: parametricStatus
             )
             .padding(.top, DesignTokens.Spacing.sm)
         }
