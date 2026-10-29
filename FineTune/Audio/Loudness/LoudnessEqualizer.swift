@@ -28,12 +28,16 @@ final class LoudnessEqualizer: @unchecked Sendable {
 
     // MARK: - Init
 
-    init(settings: LoudnessEqualizerSettings, sampleRate: Float) {
+    /// - Parameter initialGainDb: Gain to start from. A replacement instance (device switch,
+    ///   sample-rate change) passes the old instance's `currentGainDb` so the level carries on
+    ///   instead of restarting from 0 dB and pumping back up.
+    init(settings: LoudnessEqualizerSettings, sampleRate: Float, initialGainDb: Float = 0) {
         self.settings = settings
         self.kFilter = KWeightingFilter(sampleRate: sampleRate)
         self.detector = LoudnessDetector(settings: settings, sampleRate: sampleRate)
         self.gainComputer = GainComputer(settings: settings)
         self.gainSmoother = GainSmoother(settings: settings, sampleRate: sampleRate)
+        self.gainSmoother.reset(initialGainDb: initialGainDb)
         self.currentLinearGain = LoudnessEqualizerMath.dbToLinear(self.gainSmoother.currentGainDb)
     }
 
@@ -44,6 +48,10 @@ final class LoudnessEqualizer: @unchecked Sendable {
 
     /// The current settings snapshot (read from main thread for creating replacement instances).
     var currentSettings: LoudnessEqualizerSettings { settings }
+
+    /// The smoothed gain right now (read from main thread to seed a replacement instance;
+    /// a single aligned Float, so a read racing the RT thread sees the old or new value).
+    var currentGainDb: Float { gainSmoother.currentGainDb }
 
     /// Process audio from an interleaved input buffer to an interleaved output buffer.
     ///

@@ -33,6 +33,10 @@ protocol ProcessTapControlling: AnyObject, Sendable {
     var tapSourceDeviceUID: String? { get }
     func refreshTapSource(_ preferredDeviceUID: String?) async throws
     func recreateForOutputRateChange() async throws
+
+    func prepareHandover(to newDeviceUIDs: [String], preferredTapSourceDeviceUID: String?) async throws
+    func completeHandover() async -> Bool
+    func cancelHandover()
 }
 
 extension ProcessTapControlling {
@@ -64,4 +68,13 @@ extension ProcessTapControlling {
     func recreateForOutputRateChange() async throws {
         // Default no-op for mocks that don't override
     }
+
+    /// Default for mocks that don't override: no handover, so callers fall back to a normal switch.
+    func prepareHandover(to newDeviceUIDs: [String], preferredTapSourceDeviceUID: String?) async throws {
+        throw CrossfadeError.secondaryTapFailed
+    }
+
+    func completeHandover() async -> Bool { false }
+
+    func cancelHandover() {}
 }

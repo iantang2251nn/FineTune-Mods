@@ -6,6 +6,9 @@ enum CrossfadePhase: Int, Equatable {
     case idle = 0
     case warmingUp = 1
     case crossfading = 2
+    /// Both taps at full gain while the app itself moves between their devices
+    /// (see `ProcessTapController.prepareHandover`).
+    case handover = 3
 }
 
 /// RT-safe crossfade state container.
@@ -62,6 +65,16 @@ nonisolated struct CrossfadeState: @unchecked Sendable {
         totalSamples = 0
         OSMemoryBarrier()    // Flush data stores before publishing phase
         phase = .warmingUp
+    }
+
+    /// Resets counters and enters the handover phase. Call before secondary tap creation.
+    mutating func beginHandover() {
+        progress = 0
+        secondarySampleCount = 0
+        secondarySamplesProcessed = 0
+        totalSamples = 0
+        OSMemoryBarrier()    // Flush data stores before publishing phase
+        phase = .handover
     }
 
     /// Transitions from warmingUp to crossfading.
@@ -121,6 +134,8 @@ nonisolated struct CrossfadeState: @unchecked Sendable {
             return 1.0
         case .crossfading:
             return cos(progress * .pi / 2.0)
+        case .handover:
+            return 1.0
         }
     }
 
@@ -135,6 +150,8 @@ nonisolated struct CrossfadeState: @unchecked Sendable {
             return 0.0  // Muted during warmup
         case .crossfading:
             return sin(progress * .pi / 2.0)
+        case .handover:
+            return 1.0
         }
     }
 }

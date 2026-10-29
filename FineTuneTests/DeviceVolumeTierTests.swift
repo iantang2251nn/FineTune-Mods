@@ -192,7 +192,14 @@ final class MockDeviceVolumeProviding: DeviceVolumeProviding {
     }
 
     @discardableResult
-    func setDefaultDevice(_ deviceID: AudioDeviceID) -> Bool { true }
+    func setDefaultDevice(_ deviceID: AudioDeviceID) -> Bool {
+        setDefaultDeviceCalls.append(deviceID)
+        return setDefaultDeviceSucceeds
+    }
+
+    /// Records default-output changes; never updates `defaultDeviceUID` (macOS reports that later).
+    var setDefaultDeviceCalls: [AudioDeviceID] = []
+    var setDefaultDeviceSucceeds = true
 
     @discardableResult
     func setDefaultInputDevice(_ deviceID: AudioDeviceID) -> Bool { true }

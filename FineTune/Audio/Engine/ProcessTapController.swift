@@ -37,7 +37,9 @@ final class ProcessTapController: ProcessTapControlling {
 
     /// Exposes the current tap source device UID for diagnostics and tap source refresh logic.
     /// Non-nil means stream-specific tap; nil means stereo mixdown.
-    var tapSourceDeviceUID: String? { preferredTapSourceDeviceUID }
+    /// The device whose stream the active tap captures; nil for app-wide (stereo mixdown) capture,
+    /// including when a stream tap was asked for but couldn't be made.
+    var tapSourceDeviceUID: String? { primaryResources.tapDescription?.deviceUID }
 
     // MARK: - RT-Safe State (nonisolated(unsafe) for lock-free audio thread access)
     //
@@ -48,6 +50,9 @@ final class ProcessTapController: ProcessTapControlling {
 
     /// Target gain set by AudioEngine (app volume, times the device's software gain on software-volume devices). 1.0 = unity.
     private nonisolated(unsafe) var _volume: Float = 1.0
+    /// Target gain for the secondary tap during a crossfade: the destination's own volume from
+    /// the handoff, promoted to `_volume` with the tap.
+    private nonisolated(unsafe) var _secondaryVolume: Float = 1.0
     /// Current ramped volume for primary tap (smoothly approaches _volume)
     private nonisolated(unsafe) var _primaryCurrentVolume: Float = 1.0
     /// Current ramped volume for secondary tap during crossfade
@@ -155,6 +160,10 @@ final class ProcessTapController: ProcessTapControlling {
 
     /// Guard against re-entrant crossfade (ORCH-001)
     private var isSwitching = false
+    /// Output set of a prepared handover; nil when none is prepared.
+    private var handoverTargetUIDs: [String]?
+    /// Tap source to restore if a prepared handover is dropped.
+    private var handoverPreviousTapSource: String?
     /// Cancellable crossfade task — cancelled when a new switch starts
     private var crossfadeTask: Task<Void, Error>?
 
@@ -199,7 +208,10 @@ final class ProcessTapController: ProcessTapControlling {
 
     var volume: Float {
         get { _volume }
-        set { _volume = newValue }
+        set {
+            _volume = newValue
+            _secondaryVolume = newValue
+        }
     }
 
     var isMuted: Bool {
@@ -251,10 +263,11 @@ final class ProcessTapController: ProcessTapControlling {
         deviceEQProcessor?.updateSettings(settings)
     }
 
-    /// Returns the stored device EQ curve for an output UID. Set by AudioEngine; called only from
-    /// main-actor switch paths so a new tap starts with the *target* device's curve instead of
-    /// playing the old device's curve through the crossfade.
-    var deviceEQProvider: ((String) -> ParametricEQSettings)?
+    /// Returns what a new output set needs from its first callback (volume, device EQ, AutoEQ,
+    /// loudness). Set by AudioEngine; called only from main-actor switch paths so the incoming
+    /// tap starts with the *target* device's chain instead of playing the old device's through
+    /// the crossfade. Nil (or no provider) keeps the current state, as for a same-device rebuild.
+    var handoffProvider: (@MainActor (_ outputUIDs: [String]) -> TapHandoff?)?
 
     func updateAutoEQProfile(_ profile: AutoEQProfile?) {
         autoEQProcessor?.updateProfile(profile)
@@ -436,6 +449,7 @@ final class ProcessTapController: ProcessTapControlling {
     /// brief clean dip rather than a crackle. The switch can't be fully gapless: the BT link itself
     /// renegotiates across the profile change.
     func recreateForOutputRateChange() async throws {
+        dropPendingHandover()
         guard activated, let primaryUID = currentDeviceUIDs.first else { return }
         guard primaryResources.tapDescription != nil else { throw CrossfadeError.noTapDescription }
         logger.info("[RATE] \(self.app.name): recreating aggregate at new rate")
@@ -739,6 +753,7 @@ final class ProcessTapController: ProcessTapControlling {
     ///   (the source device is disconnected, so there's no audio to blend from).
     func updateDevices(to newDeviceUIDs: [String], preferredTapSourceDeviceUID: String? = nil, sourceDeviceDead: Bool = false) async throws {
         precondition(!newDeviceUIDs.isEmpty, "Must have at least one target device")
+        dropPendingHandover()
         self.preferredTapSourceDeviceUID = preferredTapSourceDeviceUID
 
         guard activated else {
@@ -793,13 +808,16 @@ final class ProcessTapController: ProcessTapControlling {
     /// the output device. Used when the system default changes and an explicitly-routed app's
     /// stream-specific tap becomes stale (captures silence on the old default's stream).
     func refreshTapSource(_ preferredDeviceUID: String?) async throws {
-        let oldPreferred = self.preferredTapSourceDeviceUID
+        dropPendingHandover()
+        let oldSource = tapSourceDeviceUID
         self.preferredTapSourceDeviceUID = preferredDeviceUID
         guard activated, let primaryUID = currentDeviceUIDs.first else { return }
-        guard oldPreferred != preferredDeviceUID else { return }
+        // Compared with what the tap actually captures, so a refresh that was cancelled, or a
+        // stream tap that fell back to mixdown, doesn't count as done.
+        guard oldSource != preferredDeviceUID else { return }
 
         let allUIDs = currentDeviceUIDs
-        logger.info("[REFRESH] Tap source changing for \(self.app.name): \(oldPreferred ?? "mixdown") → \(preferredDeviceUID ?? "mixdown")")
+        logger.info("[REFRESH] Tap source changing for \(self.app.name): \(oldSource ?? "mixdown") → \(preferredDeviceUID ?? "mixdown")")
 
         crossfadeTask?.cancel()
         crossfadeTask = Task {
@@ -987,6 +1005,105 @@ final class ProcessTapController: ProcessTapControlling {
         logger.info("[CROSSFADE] Complete")
     }
 
+    // MARK: - Handover
+
+    /// Prepares a switch whose new tap only hears the app once the app itself moves: a follow-default
+    /// app captured from the default's stream, when FineTune is about to change the macOS default.
+    /// The incoming tap starts at full gain next to the old one. Each hears the app only while it
+    /// plays to that tap's device, so when the caller changes the default the app's own move hands
+    /// the sound over, with no fade and no gap. Call `completeHandover()` after changing the default,
+    /// or `cancelHandover()` if it didn't change.
+    func prepareHandover(to newDeviceUIDs: [String], preferredTapSourceDeviceUID: String?) async throws {
+        precondition(!newDeviceUIDs.isEmpty, "Must have at least one target device")
+        guard activated, primaryResources.tapDescription != nil else { throw CrossfadeError.noTapDescription }
+        // Another switch is in flight; the caller falls back to a normal switch after it.
+        guard !isSwitching else { throw CrossfadeError.secondaryTapFailed }
+
+        isSwitching = true
+        handoverPreviousTapSource = self.preferredTapSourceDeviceUID
+        self.preferredTapSourceDeviceUID = preferredTapSourceDeviceUID
+        crossfadeState.beginHandover()
+        do {
+            try createSecondaryTap(for: newDeviceUIDs)
+        } catch {
+            dropHandover()
+            throw error
+        }
+        handoverTargetUIDs = newDeviceUIDs
+        logger.info("[HANDOVER] Prepared \(self.app.name) for \(newDeviceUIDs.count) device(s)")
+
+        // The new tap must be running before the app moves to it.
+        let transport = deviceMonitor?.device(for: newDeviceUIDs[0])?.id.readTransportType()
+        let timeoutMs = (transport == .bluetooth || transport == .bluetoothLE) ? 800 : 400
+        var elapsedMs = 0
+        while !crossfadeState.isWarmupComplete && elapsedMs < timeoutMs {
+            try? await Task.sleep(for: .milliseconds(5))
+            elapsedMs += 5
+            guard isHandoverIntact(newDeviceUIDs) else { throw CrossfadeError.secondaryTapFailed }
+        }
+        guard crossfadeState.isWarmupComplete else {
+            dropHandover()
+            throw CrossfadeError.deviceNotReady
+        }
+    }
+
+    /// Finishes a prepared handover after the caller changed the default. Waits until the app has
+    /// moved (the new tap hears it, or the old one has been quiet for 100 ms; at most 2 s), so the
+    /// old tap isn't removed while the app still plays through it, then promotes the new tap.
+    /// - Returns: Whether the tap now plays to the handover's devices.
+    func completeHandover() async -> Bool {
+        guard let target = handoverTargetUIDs else { return false }
+        var elapsedMs = 0
+        var quietMs = 0
+        while elapsedMs < 2000 {
+            try? await Task.sleep(for: .milliseconds(10))
+            elapsedMs += 10
+            guard isHandoverIntact(target) else { return false }
+            quietMs = _peakLevel < 0.0005 ? quietMs + 10 : 0
+            if elapsedMs >= 150 && (_secondaryPeakLevel > 0.0005 || quietMs >= 100) { break }
+        }
+
+        destroyPrimaryTap()
+        promoteSecondaryToPrimary()
+        crossfadeState.complete()
+        handoverTargetUIDs = nil
+        handoverPreviousTapSource = nil
+        isSwitching = false
+        targetDeviceUIDs = target
+        currentDeviceUIDs = target
+        logger.info("[HANDOVER] Complete for \(self.app.name) after \(elapsedMs)ms")
+        return true
+    }
+
+    /// Drops a prepared handover (the default didn't change); the current tap keeps playing.
+    func cancelHandover() {
+        guard handoverTargetUIDs != nil else { return }
+        dropHandover()
+        logger.info("[HANDOVER] Cancelled for \(self.app.name)")
+    }
+
+    /// True while the handover prepared for `target` still stands (no invalidation and no other
+    /// switch took the secondary tap over).
+    private func isHandoverIntact(_ target: [String]) -> Bool {
+        activated && handoverTargetUIDs == target && crossfadeState.phase == .handover && secondaryResources.isActive
+    }
+
+    /// Any other switch replaces a prepared handover, so two incoming taps never play at once.
+    private func dropPendingHandover() {
+        guard handoverTargetUIDs != nil else { return }
+        dropHandover()
+        logger.info("[HANDOVER] Replaced by another switch for \(self.app.name)")
+    }
+
+    private func dropHandover() {
+        cleanupSecondaryTap()
+        if crossfadeState.phase == .handover { crossfadeState.complete() }
+        preferredTapSourceDeviceUID = handoverPreviousTapSource
+        handoverTargetUIDs = nil
+        handoverPreviousTapSource = nil
+        isSwitching = false
+    }
+
     private func createSecondaryTap(for outputUIDs: [String]) throws {
         precondition(!outputUIDs.isEmpty, "Must have at least one output device")
 
@@ -1036,7 +1153,10 @@ final class ProcessTapController: ProcessTapControlling {
         let rampTimeSeconds: Float = 0.030
         secondaryRampCoefficient = 1 - exp(-1 / (Float(sampleRate) * rampTimeSeconds))
 
-        _secondaryCurrentVolume = _primaryCurrentVolume
+        // The secondary plays to the new output set, so it starts with everything that output needs.
+        let handoff = handoffProvider?(outputUIDs)
+        _secondaryVolume = handoff?.volume ?? _volume
+        _secondaryCurrentVolume = handoff == nil ? _primaryCurrentVolume : _secondaryVolume
 
         // Create independent EQ processors for the secondary tap.
         // Each tap needs its own biquad delay buffers — sharing would corrupt filter state
@@ -1048,22 +1168,31 @@ final class ProcessTapController: ProcessTapControlling {
         secondaryEQProcessor = secEQ
 
         let secAutoEQ = AutoEQProcessor(sampleRate: sampleRate)
-        if let profile = autoEQProcessor?.currentProfile {
+        secAutoEQ.setPreampEnabled(autoEQProcessor?.isPreampEnabled ?? true)
+        if let profile = handoff != nil ? handoff?.autoEQProfile : autoEQProcessor?.currentProfile {
             secAutoEQ.updateProfile(profile)
         }
         secondaryAutoEQProcessor = secAutoEQ
 
-        // The secondary plays to the new device, so it starts with that device's curve.
         let secDeviceEQ = ParametricEQProcessor(sampleRate: sampleRate)
-        secDeviceEQ.updateSettings(deviceEQProvider?(outputUIDs[0]) ?? .flat)
+        secDeviceEQ.updateSettings(handoff?.deviceEQ ?? deviceEQProcessor?.currentSettings ?? .flat)
         secondaryDeviceEQProcessor = secDeviceEQ
 
-        let secLoudnessEqualizer = LoudnessEqualizer(settings: loudnessEqualizerProcessor?.currentSettings ?? LoudnessEqualizerSettings(), sampleRate: Float(sampleRate))
+        // Starts at the current leveler gain so the level carries on through the switch.
+        let secLoudnessEqualizer = LoudnessEqualizer(
+            settings: loudnessEqualizerProcessor?.currentSettings ?? LoudnessEqualizerSettings(),
+            sampleRate: Float(sampleRate),
+            initialGainDb: loudnessEqualizerProcessor?.currentGainDb ?? 0
+        )
         secondaryLoudnessEqualizerProcessor = secLoudnessEqualizer
 
         let secLoudness = LoudnessCompensator(sampleRate: sampleRate)
-        secLoudness.updateForVolume(_lastLoudnessVolume)
-        if !(loudnessCompensator?.isEnabled ?? false) { secLoudness.setEnabled(false) }
+        if let handoff {
+            if handoff.loudnessCompensationEnabled { secLoudness.updateForVolume(handoff.loudnessVolume) }
+        } else {
+            secLoudness.updateForVolume(_lastLoudnessVolume)
+            if !(loudnessCompensator?.isEnabled ?? false) { secLoudness.setEnabled(false) }
+        }
         secondaryLoudnessCompensator = secLoudness
 
         nextCallbackID += 1
@@ -1155,6 +1284,7 @@ final class ProcessTapController: ProcessTapControlling {
             }
         }
 
+        _volume = _secondaryVolume
         _primaryCurrentVolume = _secondaryCurrentVolume
         _secondaryCurrentVolume = 0
         _primaryPreferredStereoLeftChannel = _secondaryPreferredStereoLeftChannel
@@ -1176,7 +1306,8 @@ final class ProcessTapController: ProcessTapControlling {
     ///   pre-switch silence wait and uses a shorter post-switch settle time.
     private func performDestructiveDeviceSwitch(to primaryDeviceUID: String, allDeviceUIDs: [String]? = nil, sourceAlreadySilent: Bool = false) async throws {
         let deviceUIDs = allDeviceUIDs ?? [primaryDeviceUID]
-        let originalVolume = _volume
+        // Fade in to the new output's own volume, not the old one's.
+        let targetVolume = handoffProvider?(deviceUIDs)?.volume ?? _volume
 
         _forceSilence = true
         OSMemoryBarrier()
@@ -1201,7 +1332,7 @@ final class ProcessTapController: ProcessTapControlling {
         _forceSilence = false
 
         for i in 1...10 {
-            _volume = originalVolume * Float(i) / 10.0
+            _volume = targetVolume * Float(i) / 10.0
             try await Task.sleep(for: .milliseconds(20))
         }
 
@@ -1284,9 +1415,14 @@ final class ProcessTapController: ProcessTapControlling {
         targetDeviceUIDs = outputUIDs
         currentDeviceUIDs = outputUIDs
 
-        // Still force-silenced here: switch the curve to the new device before audio resumes.
-        if let deviceEQ = deviceEQProvider?(outputUIDs[0]) {
-            deviceEQProcessor?.updateSettings(deviceEQ)
+        // Still force-silenced here: give the new output its own chain before audio resumes.
+        if let handoff = handoffProvider?(outputUIDs) {
+            deviceEQProcessor?.updateSettings(handoff.deviceEQ)
+            autoEQProcessor?.updateProfile(handoff.autoEQProfile)
+            if handoff.loudnessCompensationEnabled {
+                loudnessCompensator?.updateForVolume(handoff.loudnessVolume)
+            }
+            _lastLoudnessVolume = handoff.loudnessVolume
         }
 
         if let deviceSampleRate = try? primaryResources.aggregateDeviceID.readNominalSampleRate() {
@@ -1296,11 +1432,13 @@ final class ProcessTapController: ProcessTapControlling {
             deviceEQProcessor?.updateSampleRate(deviceSampleRate)
             loudnessCompensator?.updateSampleRate(deviceSampleRate)
 
-            // LoudnessEqualizer is immutable — swap to new instance at new sample rate
+            // LoudnessEqualizer is immutable — swap to new instance at new sample rate,
+            // carrying on from the current gain
             if let oldLE = loudnessEqualizerProcessor {
                 let newLE = LoudnessEqualizer(
                     settings: oldLE.currentSettings,
-                    sampleRate: Float(deviceSampleRate)
+                    sampleRate: Float(deviceSampleRate),
+                    initialGainDb: oldLE.currentGainDb
                 )
                 loudnessEqualizerProcessor = newLE
                 DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { _ = oldLE }
@@ -1805,7 +1943,7 @@ final class ProcessTapController: ProcessTapControlling {
             return
         }
 
-        let targetVol = _volume
+        let targetVol = isPrimary ? _volume : _secondaryVolume
         var currentVol: Float
         let crossfadeMultiplier: Float
         let rampCoeff: Float

@@ -49,6 +49,11 @@ final class AudioEngine {
     private var staleCleanupTask: Task<Void, Never>?  // Debounced cleanup scheduling
     private var healthMonitorTask: Task<Void, Never>?  // Periodic tap health monitor
     private var tapRecoveryCooldownUntil: [pid_t: Date] = [:]  // Prevents tap recreation thrashing
+    private var switchTargets: [pid_t: String] = [:]  // Device each in-flight move is heading to
+    private var outputDefaultRequest = 0  // Bumped per output-list choice; only the latest may land
+    /// Waits between attempts when a tap can't move to a device yet (it is still coming up).
+    /// After the last one the move is abandoned. Internal so tests can shorten it.
+    var switchRetryDelays: [Duration] = [.milliseconds(250), .milliseconds(500), .seconds(1), .seconds(2)]
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "FineTune", category: "AudioEngine")
 
     // MARK: - Priority State Machine
@@ -226,6 +231,9 @@ final class AudioEngine {
         }
         #endif
 
+        // Taps ask the engine for a destination's handoff; `self` can't be captured until init ends.
+        let handoffSource = TapHandoffSource()
+
         // Tap factory: use provided factory or default to ProcessTapController
         if let factory = tapFactory {
             self.tapFactory = factory
@@ -247,8 +255,7 @@ final class AudioEngine {
                         preferredTapSourceDeviceUID: preferredSource
                     )
                 }
-                // `self` isn't available yet; capture the settings manager directly.
-                controller.deviceEQProvider = { uid in manager.getDeviceEQ(for: uid) }
+                controller.handoffProvider = { [handoffSource] uids in handoffSource.engine?.handoff(for: app, to: uids) }
                 return controller
             }
         }
@@ -260,6 +267,8 @@ final class AudioEngine {
             guard let self, self.settingsManager.appSettings.lockInputDevice else { return }
             self.restoreLockedInputDevice()
         }
+
+        handoffSource.engine = self
 
         // Wire callbacks — needed for both test and production mode
         wireCallbacks()
@@ -835,13 +844,37 @@ final class AudioEngine {
         )
     }
 
+    /// What a tap moving to `deviceUIDs` needs from its first callback there: the output's effective
+    /// volume, device EQ, AutoEQ profile (when already loaded) and loudness level.
+    func handoff(for app: AudioApp, to deviceUIDs: [String]) -> TapHandoff? {
+        guard let primaryUID = deviceUIDs.first else { return nil }
+        let deviceVolume = deviceMonitor.device(for: primaryUID).flatMap { deviceVolumeMonitor.volumes[$0.id] } ?? 1.0
+        return TapHandoff(
+            volume: effectiveVolume(for: app.id, deviceUIDs: deviceUIDs),
+            deviceEQ: settingsManager.getDeviceEQ(for: primaryUID),
+            autoEQProfile: autoEQProfileForActivation(deviceUID: primaryUID),
+            loudnessVolume: deviceVolume * volumeState.getVolume(for: app.id),
+            loudnessCompensationEnabled: settingsManager.appSettings.loudnessCompensationEnabled
+        )
+    }
+
     /// Re-applies the per-device stages (AutoEQ, then device EQ) after a tap moved to another
     /// output, including a device that just reconnected. Safety net: the switch already started
-    /// the new tap with the target device's curve via `deviceEQProvider`; this also catches
-    /// curve edits made during the crossfade, which only reached the old processor.
+    /// the new tap with the target device's chain via `handoffProvider`; this also catches an
+    /// AutoEQ profile that wasn't loaded yet and edits made during the crossfade, which only
+    /// reached the old processors.
     private func applyDeviceProcessing(to tap: any ProcessTapControlling) {
         applyAutoEQToTap(tap)
         applyDeviceEQToTap(tap)
+        applyLoudnessToTap(tap)
+    }
+
+    /// Loudness compensation follows the output's volume, which changes with the device.
+    private func applyLoudnessToTap(_ tap: any ProcessTapControlling) {
+        tap.updateLoudnessCompensation(
+            volume: effectiveLoudnessVolume(for: tap),
+            enabled: settingsManager.appSettings.loudnessCompensationEnabled
+        )
     }
 
     /// Pushes the stored curve of the tap's primary output to the tap.
@@ -898,12 +931,100 @@ final class AudioEngine {
     /// UI code should call this instead of `deviceVolumeMonitor.setDefaultDevice` directly.
     @discardableResult
     func setDefaultOutputDevice(_ deviceID: AudioDeviceID) -> Bool {
-        guard deviceVolumeMonitor.setDefaultDevice(deviceID) else { return false }
-        if let uid = deviceMonitor.outputDevices.first(where: { $0.id == deviceID })?.uid {
-            outputEchoTracker.increment(uid)
-            lastConfirmedDefaultUID = uid
-            routeFollowsDefaultApps(to: uid)
+        guard let uid = deviceMonitor.outputDevices.first(where: { $0.id == deviceID })?.uid else {
+            return deviceVolumeMonitor.setDefaultDevice(deviceID)
         }
+        outputDefaultRequest += 1
+        let request = outputDefaultRequest
+
+        // Follow-default apps on another device move with the default. Their new taps capture the
+        // new default's stream, which only hears them once macOS moves them, so build those taps
+        // first and change the default second: each app's own move then hands its sound over with
+        // no gap. Taps that can't be prepared move the usual way once the default has changed.
+        let movers = followsDefault.compactMap { pid -> (any ProcessTapControlling)? in
+            guard let tap = taps[pid], tap.currentDeviceUIDs != [uid], switchTargets[pid] == nil,
+                  volumeState.getDeviceSelectionMode(for: pid) == .single else { return nil }
+            return tap
+        }
+        // Explicitly routed apps captured from the old default's stream stop hearing the app once
+        // it moves, so they switch to app-wide capture first, while both captures still hear it.
+        let oldDefaultUID = deviceVolumeMonitor.defaultDeviceUID
+        let explicitOnOldDefault = taps.filter { pid, tap in
+            !followsDefault.contains(pid) && switchTargets[pid] == nil
+                && oldDefaultUID != uid && tap.tapSourceDeviceUID == oldDefaultUID
+        }.map(\.value)
+        guard !movers.isEmpty || !explicitOnOldDefault.isEmpty else { return changeDefaultOutput(to: deviceID, uid: uid) }
+
+        for tap in movers { switchTargets[tap.app.id] = uid }
+        Task {
+            let releases = explicitOnOldDefault.map { tap in
+                Task {
+                    do {
+                        try await tap.refreshTapSource(nil)
+                    } catch {
+                        self.logger.error("Failed to refresh tap source for \(tap.app.name): \(error)")
+                    }
+                }
+            }
+            let preparations = movers.map { tap in
+                (tap, Task { () -> Bool in
+                    do {
+                        try await tap.prepareHandover(to: [uid], preferredTapSourceDeviceUID: uid)
+                        return true
+                    } catch {
+                        self.logger.warning("Handover not prepared for \(tap.app.name): \(error.localizedDescription)")
+                        return false
+                    }
+                })
+            }
+            for release in releases { await release.value }
+            var prepared: [any ProcessTapControlling] = []
+            for (tap, preparation) in preparations {
+                if await preparation.value {
+                    prepared.append(tap)
+                } else {
+                    self.clearSwitchTarget(tap.app.id, uid)
+                }
+            }
+
+            // A newer choice wins: drop this one's handovers instead of changing the default back.
+            guard request == self.outputDefaultRequest, self.changeDefaultOutput(to: deviceID, uid: uid) else {
+                for tap in prepared {
+                    tap.cancelHandover()
+                    self.clearSwitchTarget(tap.app.id, uid)
+                }
+                return
+            }
+
+            for tap in prepared {
+                Task {
+                    let handedOver = await tap.completeHandover()
+                    self.clearSwitchTarget(tap.app.id, uid)
+                    guard self.taps[tap.app.id] === tap else { return }
+                    if handedOver {
+                        self.applyTapOutputState(to: tap, for: tap.app.id, deviceUIDs: [uid])
+                        self.applyDeviceProcessing(to: tap)
+                    } else if self.appDeviceRouting[tap.app.id] == uid {
+                        await self.moveTap(tap, to: uid, newDefaultUID: uid)
+                    }
+                }
+            }
+        }
+        return true
+    }
+
+    /// Clears an app's in-flight marker only if it is still this move's, so a newer move keeps its own.
+    private func clearSwitchTarget(_ pid: pid_t, _ uid: String) {
+        if switchTargets[pid] == uid { switchTargets[pid] = nil }
+    }
+
+    /// Sets the macOS default, registers the echo and routes follows-default apps (those with a
+    /// prepared handover are already on their way and are skipped).
+    private func changeDefaultOutput(to deviceID: AudioDeviceID, uid: String) -> Bool {
+        guard deviceVolumeMonitor.setDefaultDevice(deviceID) else { return false }
+        outputEchoTracker.increment(uid)
+        lastConfirmedDefaultUID = uid
+        routeFollowsDefaultApps(to: uid)
         return true
     }
 
@@ -919,15 +1040,19 @@ final class AudioEngine {
             // to guard against settings file corruption or incomplete prior writes
             settingsManager.setDeviceRouting(for: app.persistenceIdentifier, deviceUID: deviceUID)
 
-            // If transitioning from follows-default to explicit and tap has a stream-specific
-            // source, refresh to mixdown so it won't go stale when the default changes later.
-            if let tap = taps[app.id], tap.tapSourceDeviceUID != nil {
-                Task {
-                    do {
-                        try await tap.refreshTapSource(nil)
-                        self.applyTapOutputState(to: tap, for: app.id)
-                    } catch {
-                        self.logger.error("Failed to refresh tap source for \(app.name): \(error)")
+            // Staying on the same device: keep the capture that device wants. Picking the default
+            // by name keeps its stream, so the level is identical to following it; a move to
+            // another device sets its own source.
+            if appDeviceRouting[app.id] == deviceUID, let tap = taps[app.id] {
+                let source = preferredTapSourceDeviceUID(forOutputUIDs: [deviceUID])
+                if tap.tapSourceDeviceUID != source {
+                    Task {
+                        do {
+                            try await tap.refreshTapSource(source)
+                            self.applyTapOutputState(to: tap, for: app.id)
+                        } catch {
+                            self.logger.error("Failed to refresh tap source for \(app.name): \(error)")
+                        }
                     }
                 }
             }
@@ -946,27 +1071,84 @@ final class AudioEngine {
                 logger.warning("No default device available for \(app.name), will route when available")
                 return
             }
+
+            // Already on the default after an explicit pick, which captured app-wide: capture the
+            // default's stream again, so the level is exactly what it was before the pick.
+            if appDeviceRouting[app.id] == defaultUID, let tap = taps[app.id], tap.tapSourceDeviceUID != defaultUID {
+                Task {
+                    do {
+                        try await tap.refreshTapSource(defaultUID)
+                        self.applyTapOutputState(to: tap, for: app.id)
+                    } catch {
+                        self.logger.error("Failed to refresh tap source for \(app.name): \(error)")
+                    }
+                }
+            }
+
             guard appDeviceRouting[app.id] != defaultUID else { return }
             appDeviceRouting[app.id] = defaultUID
         }
 
         // Switch tap if needed
         guard let targetUID = appDeviceRouting[app.id] else { return }
-        let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: [targetUID], isFollowsDefault: followsDefault.contains(app.id))
         if let tap = taps[app.id] {
-            Task {
-                do {
-                    try await tap.switchDevice(to: targetUID, preferredTapSourceDeviceUID: preferredTapSourceUID)
-                    self.applyTapOutputState(to: tap, for: app.id, deviceUIDs: [targetUID])
-                    self.applyDeviceProcessing(to: tap)
-                    self.logger.debug("Switched \(app.name) to device: \(targetUID)")
-                } catch {
-                    self.logger.error("Failed to switch device for \(app.name): \(error.localizedDescription)")
-                }
-            }
+            Task { await self.moveTap(tap, to: targetUID) }
         } else {
             ensureTapExists(for: app, deviceUID: targetUID)
         }
+    }
+
+    // MARK: - Switch Handoff
+
+    private enum MoveOutcome {
+        case moved
+        /// Routing moved on or the tap was replaced before the move landed; nothing to undo.
+        case superseded
+        /// Every attempt failed; routing now points back at the device the audio is on.
+        case failed
+    }
+
+    /// Moves `tap` to `targetUID` and applies that device's output state and processing.
+    /// A failed attempt is retried after each of `switchRetryDelays`, so a device that is still
+    /// coming up gets picked up once it is ready. Stops early when the app's routing moves on or
+    /// the tap is replaced. When every attempt fails, routing is pointed back at the device the
+    /// audio is actually on, so the UI never shows a device the app isn't playing through.
+    @discardableResult
+    /// - Parameter newDefaultUID: The output default the caller just set, when the move follows it
+    ///   (see `preferredTapSourceDeviceUID`).
+    private func moveTap(
+        _ tap: any ProcessTapControlling,
+        to targetUID: String,
+        sourceDeviceDead: Bool = false,
+        newDefaultUID: String? = nil
+    ) async -> MoveOutcome {
+        let pid = tap.app.id
+        switchTargets[pid] = targetUID
+        defer {
+            if switchTargets[pid] == targetUID { switchTargets[pid] = nil }
+        }
+
+        var delays = switchRetryDelays[...]
+        while appDeviceRouting[pid] == targetUID, taps[pid] === tap {
+            do {
+                let preferredSource = preferredTapSourceDeviceUID(forOutputUIDs: [targetUID], defaultUID: newDefaultUID)
+                try await tap.switchDevice(to: targetUID, preferredTapSourceDeviceUID: preferredSource, sourceDeviceDead: sourceDeviceDead)
+                applyTapOutputState(to: tap, for: pid, deviceUIDs: [targetUID])
+                applyDeviceProcessing(to: tap)
+                logger.debug("Switched \(tap.app.name) to device: \(targetUID)")
+                return .moved
+            } catch {
+                guard let delay = delays.popFirst() else {
+                    guard appDeviceRouting[pid] == targetUID, taps[pid] === tap else { return .superseded }
+                    logger.error("Giving up switching \(tap.app.name) to \(targetUID): \(error.localizedDescription)")
+                    appDeviceRouting[pid] = tap.currentDeviceUID
+                    return .failed
+                }
+                logger.warning("Switching \(tap.app.name) to \(targetUID) failed (\(error.localizedDescription)), retrying")
+                try? await Task.sleep(for: delay)
+            }
+        }
+        return .superseded
     }
 
     func getDeviceUID(for app: AudioApp) -> String? {
@@ -1048,10 +1230,11 @@ final class AudioEngine {
             // Tap exists - update devices
             if tap.currentDeviceUIDs != deviceUIDs {
                 do {
-                    let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: deviceUIDs, isFollowsDefault: followsDefault.contains(app.id))
+                    let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: deviceUIDs)
                     try await tap.updateDevices(to: deviceUIDs, preferredTapSourceDeviceUID: preferredTapSourceUID)
                     applyTapOutputState(to: tap, for: app.id, deviceUIDs: deviceUIDs)
                     applyDeviceEQToTap(tap)
+                    applyLoudnessToTap(tap)
                     logger.debug("Updated \(app.name) to \(deviceUIDs.count) device(s)")
                 } catch {
                     logger.error("Failed to update devices for \(app.name): \(error.localizedDescription)")
@@ -1069,7 +1252,7 @@ final class AudioEngine {
         guard taps[app.id] == nil else { return }
         guard permission.status == .authorized else { return }
 
-        let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: deviceUIDs, isFollowsDefault: followsDefault.contains(app.id))
+        let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: deviceUIDs)
         do {
             let tap = try tapFactory(app, deviceUIDs, preferredTapSourceUID)
             applyTapOutputState(to: tap, for: app.id, deviceUIDs: deviceUIDs)
@@ -1189,16 +1372,7 @@ final class AudioEngine {
             // If a tap already exists but is on the wrong device (e.g., app reappeared
             // after the default changed while it was absent), switch it.
             if let existingTap = taps[app.id], existingTap.currentDeviceUIDs != [deviceUID] {
-                let preferredSource = preferredTapSourceDeviceUID(forOutputUIDs: [deviceUID], isFollowsDefault: followsDefault.contains(app.id))
-                Task {
-                    do {
-                        try await existingTap.switchDevice(to: deviceUID, preferredTapSourceDeviceUID: preferredSource)
-                        self.applyTapOutputState(to: existingTap, for: app.id, deviceUIDs: [deviceUID])
-                        self.applyDeviceProcessing(to: existingTap)
-                    } catch {
-                        self.logger.error("Failed to re-route \(app.name) to \(deviceUID): \(error.localizedDescription)")
-                    }
-                }
+                Task { await self.moveTap(existingTap, to: deviceUID) }
                 appliedPIDs.insert(app.id)
                 continue
             }
@@ -1229,7 +1403,7 @@ final class AudioEngine {
         guard taps[app.id] == nil else { return }
         guard permission.status == .authorized else { return }
 
-        let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: [deviceUID], isFollowsDefault: followsDefault.contains(app.id))
+        let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: [deviceUID])
         do {
             let tap = try tapFactory(app, [deviceUID], preferredTapSourceUID)
             applyTapOutputState(to: tap, for: app.id, deviceUIDs: [deviceUID])
@@ -1320,6 +1494,7 @@ final class AudioEngine {
     /// Routes all followsDefault apps to the given device UID and switches their taps.
     /// Early-exits if all apps are already routed to the target (avoids unnecessary tap switches).
     private func routeFollowsDefaultApps(to targetUID: String) {
+        refreshExplicitTapSources(defaultUID: targetUID)
         guard !followsDefault.allSatisfy({ appDeviceRouting[$0] == targetUID }) else { return }
 
         for pid in followsDefault {
@@ -1328,22 +1503,15 @@ final class AudioEngine {
 
         var tapsToSwitch: [(app: AudioApp, tap: any ProcessTapControlling)] = []
         for app in apps {
-            guard followsDefault.contains(app.id), let tap = taps[app.id] else { continue }
+            guard followsDefault.contains(app.id), let tap = taps[app.id], switchTargets[app.id] != targetUID else { continue }
             tapsToSwitch.append((app, tap))
         }
         guard !tapsToSwitch.isEmpty else { return }
 
-        Task {
-            for (app, tap) in tapsToSwitch {
-                do {
-                    let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: [targetUID], isFollowsDefault: true)
-                    try await tap.switchDevice(to: targetUID, preferredTapSourceDeviceUID: preferredTapSourceUID)
-                    self.applyTapOutputState(to: tap, for: app.id, deviceUIDs: [targetUID])
-                    self.applyDeviceProcessing(to: tap)
-                } catch {
-                    self.logger.error("Failed to switch \(app.name) to \(targetUID): \(error.localizedDescription)")
-                }
-            }
+        // One task per app, so one app's retries never hold up the others. The target is the new
+        // default, so each app is captured from its stream (same level as before the switch).
+        for (_, tap) in tapsToSwitch {
+            Task { await self.moveTap(tap, to: targetUID, newDefaultUID: targetUID) }
         }
     }
 
@@ -1411,28 +1579,28 @@ final class AudioEngine {
         }
 
         // Execute device switches
-        if !singleModeTapsToSwitch.isEmpty || !multiModeTapsToUpdate.isEmpty {
+        // Handle single-mode switches — source device is dead, skip crossfade. One task per app,
+        // so one app's retries never hold up the others. A tap that can't be moved is still on
+        // the dead device: rebuild it instead.
+        for (tap, fallbackUID) in singleModeTapsToSwitch {
             Task {
-                // Handle single-mode switches — source device is dead, skip crossfade
-                for (tap, fallbackUID) in singleModeTapsToSwitch {
-                    do {
-                        let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: [fallbackUID], isFollowsDefault: true)
-                        try await tap.switchDevice(to: fallbackUID, preferredTapSourceDeviceUID: preferredTapSourceUID, sourceDeviceDead: true)
-                        self.applyTapOutputState(to: tap, for: tap.app.id, deviceUIDs: [fallbackUID])
-                        self.applyDeviceProcessing(to: tap)
-                    } catch {
-                        self.logger.error("Failed to switch \(tap.app.name) to fallback: \(error.localizedDescription)")
-                    }
+                if await self.moveTap(tap, to: fallbackUID, sourceDeviceDead: true) == .failed {
+                    await self.recreateTap(for: tap.app.id)
                 }
+            }
+        }
 
+        if !multiModeTapsToUpdate.isEmpty {
+            Task {
                 // Handle multi-mode updates (remove disconnected device from aggregate)
                 // Source device is dead, skip crossfade
                 for (tap, remainingUIDs) in multiModeTapsToUpdate {
                     do {
-                        let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: remainingUIDs, isFollowsDefault: self.followsDefault.contains(tap.app.id))
+                        let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: remainingUIDs)
                         try await tap.updateDevices(to: remainingUIDs, preferredTapSourceDeviceUID: preferredTapSourceUID, sourceDeviceDead: true)
                         self.applyTapOutputState(to: tap, for: tap.app.id, deviceUIDs: remainingUIDs)
                         self.applyDeviceEQToTap(tap)
+                        self.applyLoudnessToTap(tap)
                         self.logger.debug("Removed \(deviceName) from \(tap.app.name) multi-device output")
                     } catch {
                         self.logger.error("Failed to update \(tap.app.name) devices: \(error.localizedDescription)")
@@ -1460,11 +1628,15 @@ final class AudioEngine {
         // Register newly connected device in priority list
         settingsManager.ensureDeviceInPriority(deviceUID)
 
+        // A device that is present but not alive yet can't take audio. Apps stay where they are;
+        // the alive watcher installed below runs this again once it is, and they move back then.
+        let isReady = deviceMonitor.device(for: deviceUID).map { isAliveCheck($0.id) } ?? false
+
         var affectedApps: [AudioApp] = []
         var tapsToSwitch: [any ProcessTapControlling] = []
 
         // Iterate over taps for consistency with handleDeviceDisconnected
-        for tap in taps.values {
+        for tap in taps.values where isReady {
             let app = tap.app
 
             // Skip apps that are PERSISTED as following default - they don't have explicit device preferences
@@ -1475,8 +1647,9 @@ final class AudioEngine {
             let persistedUID = settingsManager.getDeviceRouting(for: app.persistenceIdentifier)
             guard persistedUID == deviceUID else { continue }
 
-            // App was pinned to this device - switch it back
-            guard appDeviceRouting[app.id] != deviceUID else { continue }
+            // App was pinned to this device - switch it back, unless its audio is already there
+            // or on its way (an earlier attempt that never landed is tried again)
+            guard tap.currentDeviceUIDs != [deviceUID], switchTargets[app.id] != deviceUID else { continue }
 
             affectedApps.append(app)
             appDeviceRouting[app.id] = deviceUID
@@ -1485,30 +1658,25 @@ final class AudioEngine {
             tapsToSwitch.append(tap)
         }
 
-        if !tapsToSwitch.isEmpty {
+        for tap in tapsToSwitch {
             Task {
-                for tap in tapsToSwitch {
-                    do {
-                        let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: [deviceUID], isFollowsDefault: false)
-                        try await tap.switchDevice(to: deviceUID, preferredTapSourceDeviceUID: preferredTapSourceUID)
-                        self.applyTapOutputState(to: tap, for: tap.app.id, deviceUIDs: [deviceUID])
-                        self.applyDeviceProcessing(to: tap)
-                    } catch {
-                        self.logger.error("Failed to switch \(tap.app.name) back to \(deviceName): \(error.localizedDescription)")
-                    }
+                // Still on the fallback: keep it marked as displaced so the UI shows "System Audio".
+                if await self.moveTap(tap, to: deviceUID) == .failed {
+                    self.followsDefault.insert(tap.app.id)
                 }
             }
         }
 
         // Second pass: restore multi-device apps that had this device in their selection
         var multiModeTapsToUpdate: [any ProcessTapControlling] = []
-        for tap in taps.values {
+        for tap in taps.values where isReady {
             let app = tap.app
             guard settingsManager.getDeviceSelectionMode(for: app.persistenceIdentifier) == .multi else { continue }
             guard let persistedUIDs = settingsManager.getSelectedDeviceUIDs(for: app.persistenceIdentifier),
                   persistedUIDs.contains(deviceUID) else { continue }
+            // Checked against the tap, not the selection, so an update that never landed is retried
+            guard !tap.currentDeviceUIDs.contains(deviceUID) else { continue }
             let currentUIDs = volumeState.getSelectedDeviceUIDs(for: app.id)
-            guard !currentUIDs.contains(deviceUID) else { continue }
 
             // Add the reconnected device back to in-memory selection
             var updatedUIDs = currentUIDs
@@ -1807,13 +1975,36 @@ final class AudioEngine {
     }
 
     /// Returns the preferred tap source device UID for stream-specific capture.
-    /// Only follows-default apps use stream-specific taps (multichannel preserved, tap always
-    /// valid because the app switches device when default changes). Explicitly-routed apps
-    /// always use stereo mixdown (nil) — their tap never goes stale when the default changes.
-    private func preferredTapSourceDeviceUID(forOutputUIDs outputUIDs: [String], isFollowsDefault: Bool) -> String? {
-        guard isFollowsDefault else { return nil }
-        guard let defaultUID = deviceVolumeMonitor.defaultDeviceUID else { return nil }
+    /// An app playing to the macOS default is captured from the default's stream (apps render to
+    /// the default, and multichannel is preserved), whether it follows the default or was picked
+    /// explicitly, so both give the identical level. Stereo mixdown (nil) plays quieter on
+    /// interfaces with more than two outputs and is used only for apps routed elsewhere, whose
+    /// capture must keep hearing the app wherever macOS sends it. When the default changes,
+    /// `refreshExplicitTapSources` brings explicitly routed taps back in line.
+    /// - Parameter defaultUID: The default the caller just set. The monitor's copy only updates
+    ///   when macOS reports the change, so right after setting the default it still names the old
+    ///   device, which would wrongly pick mixdown.
+    private func preferredTapSourceDeviceUID(forOutputUIDs outputUIDs: [String], defaultUID: String? = nil) -> String? {
+        guard let defaultUID = defaultUID ?? deviceVolumeMonitor.defaultDeviceUID else { return nil }
         return outputUIDs.contains(defaultUID) ? defaultUID : nil
+    }
+
+    /// After a default change, gives each explicitly routed tap the capture
+    /// `preferredTapSourceDeviceUID` wants for the new default: the default's stream when the app
+    /// plays to it, app-wide otherwise. Follow-default apps get theirs with the move itself.
+    private func refreshExplicitTapSources(defaultUID: String) {
+        for (pid, tap) in taps where !followsDefault.contains(pid) && switchTargets[pid] == nil {
+            let source = preferredTapSourceDeviceUID(forOutputUIDs: tap.currentDeviceUIDs, defaultUID: defaultUID)
+            guard tap.tapSourceDeviceUID != source else { continue }
+            Task {
+                do {
+                    try await tap.refreshTapSource(source)
+                    self.applyTapOutputState(to: tap, for: pid)
+                } catch {
+                    self.logger.error("Failed to refresh tap source for \(tap.app.name): \(error)")
+                }
+            }
+        }
     }
 
     private func cleanupStaleTaps() {
@@ -1953,12 +2144,34 @@ final class AudioEngine {
         healthMonitorTask = nil
     }
 
+    /// Where `pid` should play now: its multi-device selection or routed device, limited to devices
+    /// that are present and alive, else the highest-priority live device. `current` is the last
+    /// resort when nothing is live.
+    private func liveRoute(for pid: pid_t, current: [String]) -> [String] {
+        let isLive = { (uid: String) in self.deviceMonitor.device(for: uid).map { self.isAliveCheck($0.id) } ?? false }
+        if volumeState.getDeviceSelectionMode(for: pid) == .multi {
+            let selected = volumeState.getSelectedDeviceUIDs(for: pid).sorted().filter(isLive)
+            if !selected.isEmpty { return selected }
+        } else if let routed = appDeviceRouting[pid], isLive(routed) {
+            return [routed]
+        }
+        if let fallback = Self.resolveHighestPriority(
+            priorityOrder: settingsManager.devicePriorityOrder,
+            connectedDevices: outputDevices,
+            isAlive: isAliveCheck
+        ) {
+            return [fallback.uid]
+        }
+        return current
+    }
+
     /// Tears down and recreates a tap for a given PID, preserving routing and settings.
     /// Async: awaits full CoreAudio resource teardown before creating the replacement tap
     /// to prevent orphaned IO procs from accumulating (issue #176).
     private func recreateTap(for pid: pid_t) async {
         guard let oldTap = taps.removeValue(forKey: pid) else { return }
-        let deviceUIDs = oldTap.currentDeviceUIDs
+        // Rebuild where the app should play, not on the device the stalled tap was stuck on
+        let deviceUIDs = liveRoute(for: pid, current: oldTap.currentDeviceUIDs)
         await oldTap.invalidateAsync()
 
         // Set cooldown to prevent thrashing
@@ -1974,13 +2187,19 @@ final class AudioEngine {
         // Allow re-initialization
         appliedPIDs.remove(pid)
 
-        // Re-route to the same device(s), preserving multi-device routing
+        // Re-route, preserving multi-device routing
         if deviceUIDs.count > 1 {
             ensureTapWithDevices(for: app, deviceUIDs: deviceUIDs)
             if taps[app.id] != nil {
                 appDeviceRouting[app.id] = deviceUIDs[0]
             }
         } else if let deviceUID = deviceUIDs.first {
+            if appDeviceRouting[pid] != deviceUID {
+                // Its own device is gone or not ready: play on the fallback until it returns
+                // (the persisted choice is untouched, so replug moves it back)
+                appDeviceRouting[pid] = deviceUID
+                followsDefault.insert(pid)
+            }
             ensureTapExists(for: app, deviceUID: deviceUID)
         }
 
@@ -2222,6 +2441,13 @@ final class AudioEngine {
             lockToBuiltInMicrophone()
         }
     }
+}
+
+/// Lets taps built by the engine's default factory reach the engine, which doesn't exist yet
+/// when the factory closure is made.
+@MainActor
+private final class TapHandoffSource {
+    weak var engine: AudioEngine?
 }
 
 // MARK: - URLHandlerEngine Conformance
