@@ -1,20 +1,22 @@
 <img src="assets/icon.png" width="170" height="170" alt="FineTune app icon" align="left"/>
 
-<h3>FineTune</h3>
+<h3>FineTune-Mods</h3>
 
 Control the volume of every app independently, route audio to different speakers, and shape your sound with EQ and headphone correction. Lives in your menu bar. Free and open-source.
 
-<a href="https://github.com/ronitsingh10/FineTune/releases/latest/download/FineTune.dmg"><img src="assets/download-badge.svg" alt="Download for macOS" height="48"/></a>
+A fork of [FineTune](https://github.com/ronitsingh10/FineTune) by Ronit Singh, adding a per-device parametric EQ, L/R channel trims and seamless output switching. See [About this fork](#about-this-fork).
+
+<a href="https://github.com/iantang2251nn/FineTune-Mods/releases/latest/download/FineTune-Mods.dmg"><img src="assets/download-badge.svg" alt="Download for macOS" height="48"/></a>
 
 <br clear="all"/>
 
 <p align="center">
-  <a href="https://github.com/ronitsingh10/FineTune/releases/latest"><img src="https://img.shields.io/github/v/release/ronitsingh10/FineTune?style=for-the-badge&labelColor=1c1c1e&color=0A84FF&logo=github&logoColor=white" alt="Latest Release"></a>
-  <a href="https://github.com/ronitsingh10/FineTune/releases"><img src="https://img.shields.io/github/downloads/ronitsingh10/FineTune/total?style=for-the-badge&labelColor=1c1c1e&color=3a3a3c" alt="Downloads"></a>
+  <a href="https://github.com/iantang2251nn/FineTune-Mods/releases/latest"><img src="https://img.shields.io/github/v/release/iantang2251nn/FineTune-Mods?style=for-the-badge&labelColor=1c1c1e&color=0A84FF&logo=github&logoColor=white" alt="Latest Release"></a>
+  <a href="https://github.com/iantang2251nn/FineTune-Mods/releases"><img src="https://img.shields.io/github/downloads/iantang2251nn/FineTune-Mods/total?style=for-the-badge&labelColor=1c1c1e&color=3a3a3c" alt="Downloads"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPLv3-3a3a3c?style=for-the-badge&labelColor=1c1c1e" alt="License: GPL v3"></a>
   <a href="https://ko-fi.com/ronitsingh10"><img src="https://img.shields.io/badge/Tip_on_Ko--fi-FF5E5B?style=for-the-badge&labelColor=1c1c1e&logo=ko-fi&logoColor=white" alt="Tip on
   Ko-fi"></a>
-  <a href="https://www.apple.com/macos/"><img src="https://img.shields.io/badge/macOS-15%2B-3a3a3c?style=for-the-badge&labelColor=1c1c1e&logo=apple&logoColor=white" alt="macOS 15+"></a>
+  <a href="https://www.apple.com/macos/"><img src="https://img.shields.io/badge/macOS-15.4%2B-3a3a3c?style=for-the-badge&labelColor=1c1c1e&logo=apple&logoColor=white" alt="macOS 15.4+"></a>
 </p>
 
 <p align="center">
@@ -30,13 +32,25 @@ Control the volume of every app independently, route audio to different speakers
 
 ## Install
 
-**Homebrew** (recommended)
+**Easiest: one line in Terminal** (recommended)
+
+Open **Terminal** (⌘Space, type "Terminal", press Return), paste this line and press Return:
 
 ```bash
-brew install --cask finetune
+curl -fsSL https://raw.githubusercontent.com/iantang2251nn/FineTune-Mods/main/scripts/install.sh | bash
 ```
 
-**Manual** — [Download latest release](https://github.com/ronitsingh10/FineTune/releases/latest)
+It downloads the latest release, installs it into Applications and opens it — no security prompts to click through. Run the same line again to update.
+
+**Or download the DMG** — [latest release](https://github.com/iantang2251nn/FineTune-Mods/releases/latest)
+
+1. Open the DMG and drag **FineTune** into **Applications**.
+2. Open FineTune. macOS says it can't verify the app: click **Done** (not Move to Trash).
+3. Open **System Settings → Privacy & Security**, scroll down, click **Open Anyway** next to FineTune and enter your password.
+
+This only happens once. The app isn't notarized by Apple, which needs a paid developer account; the one-line install avoids the prompt because files downloaded in Terminal aren't flagged.
+
+> **Note:** `brew install --cask finetune` and the original project's downloads install upstream FineTune, without this fork's changes. FineTune-Mods replaces FineTune if both are installed (same app, same settings), and doesn't update itself: run the install line again for a new version.
 
 ## Quick Start
 
@@ -47,6 +61,18 @@ brew install --cask finetune
 That's it. Adjust sliders, route audio, and explore EQ from the menu bar.
 
 > **Tip:** Want FineTune to auto-switch to a specific device when you connect it? Open edit mode (pencil icon) and drag it above the built-in speakers. This is a one-time setup. Your preferred order is saved permanently.
+
+## About this fork
+
+FineTune-Mods is based on FineTune v1.9.0. Everything below in Features still applies; this fork adds:
+
+- **Device parametric EQ** — A 10-band parametric EQ per output device (low shelf, 8 peaks, high shelf) with a live response curve. Drag a node to set frequency and gain, scroll over it for Q, double-click to reset; type or drag exact values. Saved per device and re-applied when the device reconnects.
+- **Import and export** — Load EqualizerAPO or REW filter files into the device EQ, and export your curve as EqualizerAPO text.
+- **L/R channel trims** — Raise or lower the left or right channel of a device by up to 12 dB in 0.1 dB steps, for matching monitors.
+- **EQ on every interface** — The EQ chain runs on multichannel and split-channel audio interfaces, on the device's stereo pair.
+- **Seamless output switching** — No dip when switching outputs from FineTune, and the level returns exactly when you switch back. "System Audio" and picking the same device by name sound identical. Switches that fail while a device starts up are retried, apps return to a replugged device once it's ready, and the new device gets its EQ, AutoEQ and loudness settings from the first sample.
+- **Graphic EQ reset** — Double-click a band label to reset it to 0 dB.
+- **No per-app boost** — The 2x–4x per-app volume boost is removed; it drove the limiter into audible clipping.
 
 ## Features
 
@@ -101,25 +127,25 @@ That's it. Adjust sliders, route audio, and explore EQ from the menu bar.
 ## Contributing
 
 - **Star this repo** — Help others discover FineTune
-- **Report bugs** — [Open an issue](https://github.com/ronitsingh10/FineTune/issues)
+- **Report bugs** — [Open an issue](https://github.com/iantang2251nn/FineTune-Mods/issues) for this fork; for issues that also happen in upstream FineTune, see [its tracker](https://github.com/ronitsingh10/FineTune/issues)
 - **Contribute code** — See [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ### Build from Source
 
 ```bash
-git clone https://github.com/ronitsingh10/FineTune.git
-cd FineTune
+git clone https://github.com/iantang2251nn/FineTune-Mods.git
+cd FineTune-Mods
 open FineTune.xcodeproj
 ```
 
 ## Requirements
 
-- macOS 15.0 (Sequoia) or later
+- macOS 15.4 (Sequoia) or later
 - Audio capture permission (prompted on first launch)
 
 ## Support
 
-FineTune is free and open source, forever. If it made your day a little easier, you can buy me a coffee — but genuinely not expected 🙏
+FineTune is free and open source, forever. If it made your day a little easier, you can support its original author, Ronit Singh — but genuinely not expected 🙏
 
 [![Buy me a coffee](https://img.shields.io/badge/Buy_me_a_coffee-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/ronitsingh10)
 

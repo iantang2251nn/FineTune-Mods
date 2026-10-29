@@ -1,19 +1,21 @@
 <img src="assets/icon.png" width="170" height="170" alt="FineTune 应用图标" align="left"/>
 
-<h3>FineTune</h3>
+<h3>FineTune-Mods</h3>
 
 为每一个 App 单独控制音量、把音频路由到不同的扬声器，再用 EQ 和耳机曲线把声音调到自己喜欢的样子。常驻菜单栏，免费且开源。
 
-<a href="https://github.com/ronitsingh10/FineTune/releases/latest/download/FineTune.dmg"><img src="assets/download-badge.svg" alt="下载 macOS 版本" height="48"/></a>
+本项目是 Ronit Singh 的 [FineTune](https://github.com/ronitsingh10/FineTune) 的分支，新增按设备的参数 EQ、左右声道微调以及无缝切换输出设备。详见英文版 README 的 [About this fork](README.md#about-this-fork)。
+
+<a href="https://github.com/iantang2251nn/FineTune-Mods/releases/latest/download/FineTune-Mods.dmg"><img src="assets/download-badge.svg" alt="下载 macOS 版本" height="48"/></a>
 
 <br clear="all"/>
 
 <p align="center">
-  <a href="https://github.com/ronitsingh10/FineTune/releases/latest"><img src="https://img.shields.io/github/v/release/ronitsingh10/FineTune?style=for-the-badge&labelColor=1c1c1e&color=0A84FF&logo=github&logoColor=white" alt="最新版本"></a>
-  <a href="https://github.com/ronitsingh10/FineTune/releases"><img src="https://img.shields.io/github/downloads/ronitsingh10/FineTune/total?style=for-the-badge&labelColor=1c1c1e&color=3a3a3c" alt="下载量"></a>
+  <a href="https://github.com/iantang2251nn/FineTune-Mods/releases/latest"><img src="https://img.shields.io/github/v/release/iantang2251nn/FineTune-Mods?style=for-the-badge&labelColor=1c1c1e&color=0A84FF&logo=github&logoColor=white" alt="最新版本"></a>
+  <a href="https://github.com/iantang2251nn/FineTune-Mods/releases"><img src="https://img.shields.io/github/downloads/iantang2251nn/FineTune-Mods/total?style=for-the-badge&labelColor=1c1c1e&color=3a3a3c" alt="下载量"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPLv3-3a3a3c?style=for-the-badge&labelColor=1c1c1e" alt="许可证：GPL v3"></a>
   <a href="https://ko-fi.com/ronitsingh10"><img src="https://img.shields.io/badge/Tip_on_Ko--fi-FF5E5B?style=for-the-badge&labelColor=1c1c1e&logo=ko-fi&logoColor=white" alt="在 Ko-fi 打赏"></a>
-  <a href="https://www.apple.com/macos/"><img src="https://img.shields.io/badge/macOS-15%2B-3a3a3c?style=for-the-badge&labelColor=1c1c1e&logo=apple&logoColor=white" alt="macOS 15+"></a>
+  <a href="https://www.apple.com/macos/"><img src="https://img.shields.io/badge/macOS-15.4%2B-3a3a3c?style=for-the-badge&labelColor=1c1c1e&logo=apple&logoColor=white" alt="macOS 15.4+"></a>
 </p>
 
 <p align="center">
@@ -32,13 +34,25 @@
 
 ## 安装
 
-**Homebrew**（推荐）
+**最简单：在「终端」里运行一行命令**（推荐）
+
+打开「终端」（⌘空格，输入 Terminal，回车），粘贴下面这一行并回车：
 
 ```bash
-brew install --cask finetune
+curl -fsSL https://raw.githubusercontent.com/iantang2251nn/FineTune-Mods/main/scripts/install.sh | bash
 ```
 
-**手动安装** —— [下载最新版本](https://github.com/ronitsingh10/FineTune/releases/latest)
+它会下载最新版本、安装到「应用程序」并直接打开，无需处理任何安全提示。再次运行同一行即可更新。
+
+**或者下载 DMG** —— [最新版本](https://github.com/iantang2251nn/FineTune-Mods/releases/latest)
+
+1. 打开 DMG，把 **FineTune** 拖进「应用程序」。
+2. 打开 FineTune。系统提示无法验证该 App 时，点 **完成**（不要点「移到废纸篓」）。
+3. 打开 **系统设置 → 隐私与安全性**，向下滚动，点 FineTune 旁边的 **仍要打开**，输入密码。
+
+这一步只需要做一次。该 App 没有经过 Apple 公证（需要付费开发者账号）；用终端一行命令安装则不会出现这个提示。
+
+> **注意：** `brew install --cask finetune` 和原项目的下载链接安装的是原版 FineTune，不包含本分支的改动。FineTune-Mods 会替换已安装的 FineTune（同一个 App、同一份设置），且不会自动更新：需要新版本时再运行一次安装命令即可。
 
 ## 快速上手
 
@@ -103,20 +117,20 @@ brew install --cask finetune
 ## 参与贡献
 
 - **给本仓库点 Star** —— 帮助更多人发现 FineTune
-- **报告 Bug** —— [新建 issue](https://github.com/ronitsingh10/FineTune/issues)
+- **报告 Bug** —— 本分支的问题请在 [这里新建 issue](https://github.com/iantang2251nn/FineTune-Mods/issues)；原版 FineTune 也有的问题请提交到 [原项目](https://github.com/ronitsingh10/FineTune/issues)
 - **贡献代码** —— 见 [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ### 从源码构建
 
 ```bash
-git clone https://github.com/ronitsingh10/FineTune.git
-cd FineTune
+git clone https://github.com/iantang2251nn/FineTune-Mods.git
+cd FineTune-Mods
 open FineTune.xcodeproj
 ```
 
 ## 系统要求
 
-- macOS 15.0 (Sequoia) 或更高版本
+- macOS 15.4 (Sequoia) 或更高版本
 - 音频采集权限（首次启动时弹出请求）
 
 ## 支持作者
